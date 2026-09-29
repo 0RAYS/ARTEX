@@ -129,7 +129,7 @@ func TestRunHTTPTool(t *testing.T) {
 		"body":    `{"flag":"{flag}"}`,
 	})
 	res, err := (&Server{}).runHTTPTool(context.Background(), execRaw,
-		map[string]any{"flag": "CTF{x}", "token": "sekret"})
+		map[string]any{"flag": "CTF{x}", "token": "sekret"}, nil)
 	if err != nil {
 		t.Fatalf("runHTTPTool: %v", err)
 	}
@@ -165,14 +165,23 @@ func TestDetectPython(t *testing.T) {
 	}
 }
 
-func TestClipOutput(t *testing.T) {
-	long := strings.Repeat("x", 7000)
-	got := clipOutput(long, nil)
-	if len(got) >= 7000 || !strings.Contains(got, "截断") {
-		t.Fatalf("clipOutput should truncate long output, got len %d", len(got))
+// The http tool must truncate an oversized response through norma's Capture, the
+// same valve every other tool uses — a session with no OutputDir falls back to a
+// head+tail cut, so a body far past the default cap comes back shortened.
+func TestHTTPToolTruncatesLargeBody(t *testing.T) {
+	big := strings.Repeat("x", 40000) // past Capture's 30000 default
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(big))
+	}))
+	defer srv.Close()
+
+	execRaw, _ := json.Marshal(map[string]any{"method": "GET", "url": srv.URL})
+	res, err := (&Server{}).runHTTPTool(context.Background(), execRaw, map[string]any{}, nil)
+	if err != nil {
+		t.Fatalf("runHTTPTool: %v", err)
 	}
-	short := "ok"
-	if clipOutput(short, nil) != short {
-		t.Fatal("clipOutput should pass short output through")
+	out := res.Flatten()
+	if len(out) >= 40000 {
+		t.Fatalf("oversized http body was not truncated: len=%d", len(out))
 	}
 }

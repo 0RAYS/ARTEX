@@ -292,7 +292,7 @@ func (c *Client) wrap(rt remoteTool) actool.CoreTool {
 		Permissions: func(context.Context, json.RawMessage, permission.Context) permission.Decision {
 			return permission.AskUser("call MCP tool " + full + "?")
 		},
-		Run: func(ctx context.Context, in json.RawMessage, _ *actool.ToolContext) (actool.Result, error) {
+		Run: func(ctx context.Context, in json.RawMessage, tc *actool.ToolContext) (actool.Result, error) {
 			var args any
 			if len(in) > 0 {
 				_ = json.Unmarshal(in, &args)
@@ -315,7 +315,10 @@ func (c *Client) wrap(rt remoteTool) actool.CoreTool {
 			for _, blk := range res.Content {
 				text += blk.Text
 			}
-			return actool.Result{Content: []llm.ContentBlock{llm.TextBlock(text)}, IsError: res.IsError}, nil
+			// 与内置/自定义工具一致：超长输出走 Capture——按会话 MaxOutputChars（默认
+			// 30000）截断，配了 ToolOutputDir 时全量溢写到磁盘只留 head + 指针，避免大
+			// MCP 结果整段灌爆上下文。
+			return actool.Result{Content: []llm.ContentBlock{llm.TextBlock(actool.Capture(tc, text))}, IsError: res.IsError}, nil
 		},
 	})
 }
