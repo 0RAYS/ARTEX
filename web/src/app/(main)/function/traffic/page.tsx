@@ -7,13 +7,13 @@ import {
   ArrowUpNarrowWideIcon,
   ChevronLeftIcon,
   ChevronRightIcon,
+  FilterXIcon,
   ListChecksIcon,
   Loader2Icon,
   RadioTowerIcon,
   SearchIcon,
   Trash2Icon,
 } from "lucide-react";
-import { toast } from "sonner";
 
 import { HttpCodeBlock } from "@/components/http-code-block";
 import { LinkTrafficDialog } from "@/components/link-traffic-dialog";
@@ -35,10 +35,12 @@ import { Input } from "@/components/ui/input";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Sheet, SheetContent, SheetDescription, SheetHeader, SheetTitle } from "@/components/ui/sheet";
+import { SortableHead } from "@/components/ui/sortable-head";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { api } from "@/lib/api";
+import { useStoredSortPreference } from "@/lib/sort-preference";
 import type { TrafficDetail, TrafficExchange, TrafficHost, TrafficResp } from "@/lib/types";
 import { cn } from "@/lib/utils";
 
@@ -95,6 +97,16 @@ const METHODS = ["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"];
 const PAGE_SIZES = [25, 50, 100, 200];
 type HostCountSortDirection = "asc" | "desc";
 
+// Server-sortable columns. The list is sent to the backend verbatim as `sort`,
+// which whitelists these same names, so keep them in sync with traffic.Page.
+const SORT_FIELDS = ["ts", "status", "resp_len"] as const;
+type SortField = (typeof SORT_FIELDS)[number];
+const SORT_STORAGE_KEY = "traffic-sort";
+
+// Status-class buckets for the filter dropdown; the value is sent as `status`,
+// which the backend reads as either an exact code or an "Nxx" class band.
+const STATUS_BUCKETS = ["2xx", "3xx", "4xx", "5xx"];
+
 export default function TrafficPage() {
   const [selectedFlows, setSelectedFlows] = React.useState<Set<string>>(() => new Set());
   const [linking, setLinking] = React.useState(false);
@@ -105,6 +117,20 @@ export default function TrafficPage() {
   const [query, setQuery] = React.useState(""); // raw free-text input
   const [queryQ, setQueryQ] = React.useState(""); // debounced → server
   const [method, setMethod] = React.useState("all");
+
+  // Advanced filters (issue #177): response-body content, path, status class and
+  // response-size range. Text inputs are debounced like host/query; the status
+  // select applies immediately.
+  const [body, setBody] = React.useState("");
+  const [bodyQ, setBodyQ] = React.useState("");
+  const [path, setPath] = React.useState("");
+  const [pathQ, setPathQ] = React.useState("");
+  const [statusFilter, setStatusFilter] = React.useState("all");
+  const [respMin, setRespMin] = React.useState("");
+  const [respMinQ, setRespMinQ] = React.useState("");
+  const [respMax, setRespMax] = React.useState("");
+  const [respMaxQ, setRespMaxQ] = React.useState("");
+  const [sort, setSort] = useStoredSortPreference<SortField>(SORT_STORAGE_KEY, SORT_FIELDS, "ts", "desc");
 
   const [traffic, setTraffic] = React.useState<TrafficResp | null>(null);
   const [selected, setSelected] = React.useState<TrafficExchange | null>(null);
@@ -129,12 +155,41 @@ export default function TrafficPage() {
     const t = setTimeout(() => setQueryQ(query.trim()), 300);
     return () => clearTimeout(t);
   }, [query]);
+  React.useEffect(() => {
+    const t = setTimeout(() => setBodyQ(body.trim()), 300);
+    return () => clearTimeout(t);
+  }, [body]);
+  React.useEffect(() => {
+    const t = setTimeout(() => setPathQ(path.trim()), 300);
+    return () => clearTimeout(t);
+  }, [path]);
+  React.useEffect(() => {
+    const t = setTimeout(() => setRespMinQ(respMin.trim()), 300);
+    return () => clearTimeout(t);
+  }, [respMin]);
+  React.useEffect(() => {
+    const t = setTimeout(() => setRespMaxQ(respMax.trim()), 300);
+    return () => clearTimeout(t);
+  }, [respMax]);
 
-  // Any filter/size change resets to the first page.
+  const hasAdvancedFilter = Boolean(bodyQ || pathQ || respMinQ || respMaxQ) || statusFilter !== "all";
+  const resetAdvancedFilters = () => {
+    setBody("");
+    setBodyQ("");
+    setPath("");
+    setPathQ("");
+    setStatusFilter("all");
+    setRespMin("");
+    setRespMinQ("");
+    setRespMax("");
+    setRespMaxQ("");
+  };
+
+  // Any filter/size/sort change resets to the first page.
   // biome-ignore lint/correctness/useExhaustiveDependencies: these values intentionally trigger a page reset.
   React.useEffect(() => {
     setPage(0);
-  }, [hostQ, queryQ, method, size]);
+  }, [hostQ, queryQ, method, size, bodyQ, pathQ, statusFilter, respMinQ, respMaxQ, sort]);
 
   // Load the current page. Auto-refresh only on page 0 (newest) so paging back
   // through history isn't yanked out from under the user.
@@ -143,7 +198,15 @@ export default function TrafficPage() {
     let alive = true;
     const load = () => {
       api
-        .traffic(page, size, hostQ, method, queryQ)
+        .traffic(page, size, hostQ, method, queryQ, {
+          body: bodyQ,
+          path: pathQ,
+          status: statusFilter,
+          respMin: respMinQ,
+          respMax: respMaxQ,
+          sort: sort.field,
+          order: sort.direction,
+        })
         .then((r) => {
           if (alive) setTraffic(r);
         })
@@ -168,7 +231,7 @@ export default function TrafficPage() {
       alive = false;
       clearInterval(t);
     };
-  }, [page, size, hostQ, method, queryQ, reloadTick]);
+  }, [page, size, hostQ, method, queryQ, bodyQ, pathQ, statusFilter, respMinQ, respMaxQ, sort, reloadTick]);
 
   // Delete traffic for the current host filter (substring) or the checked
   // hosts (exact batch), then refetch.
@@ -226,6 +289,15 @@ export default function TrafficPage() {
       alive = false;
     };
   }, [selected]);
+
+  // Toggle direction when re-clicking the active column, else sort the new column
+  // newest/largest-first.
+  const toggleSort = (field: SortField) =>
+    setSort((prev) =>
+      prev.field === field
+        ? { field, direction: prev.direction === "asc" ? "desc" : "asc" }
+        : { field, direction: "desc" },
+    );
 
   const exchanges = React.useMemo(() => traffic?.exchanges ?? [], [traffic]);
   const total = traffic?.total ?? exchanges.length;
@@ -425,6 +497,66 @@ export default function TrafficPage() {
         </div>
       </div>
 
+      {/* Advanced filters (issue #177): narrow 660k+ exchanges down to the one packet. */}
+      <div className="flex flex-wrap items-center gap-2 rounded-md border bg-muted/30 px-2 py-1.5">
+        <span className="pl-1 text-xs font-medium text-muted-foreground">高级筛选</span>
+        <div className="relative w-56">
+          <Input
+            placeholder="响应内容（正文关键词，≥3字）"
+            value={body}
+            onChange={(e) => setBody(e.target.value)}
+            className="h-8"
+          />
+        </div>
+        <div className="relative w-52">
+          <Input
+            placeholder="路径（如 /api/user/…）"
+            value={path}
+            onChange={(e) => setPath(e.target.value)}
+            className="h-8"
+          />
+        </div>
+        <Select value={statusFilter} onValueChange={setStatusFilter}>
+          <SelectTrigger size="sm" className="w-28">
+            <SelectValue placeholder="状态码" />
+          </SelectTrigger>
+          <SelectContent>
+            <SelectItem value="all">全部状态码</SelectItem>
+            {STATUS_BUCKETS.map((s) => (
+              <SelectItem key={s} value={s}>
+                {s}
+              </SelectItem>
+            ))}
+          </SelectContent>
+        </Select>
+        <div className="flex items-center gap-1 text-xs text-muted-foreground">
+          <span>响应长度</span>
+          <Input
+            type="number"
+            min={0}
+            placeholder="最小(B)"
+            value={respMin}
+            onChange={(e) => setRespMin(e.target.value)}
+            className="h-8 w-24"
+          />
+          <span>–</span>
+          <Input
+            type="number"
+            min={0}
+            placeholder="最大(B)"
+            value={respMax}
+            onChange={(e) => setRespMax(e.target.value)}
+            className="h-8 w-24"
+          />
+        </div>
+        {hasAdvancedFilter ? (
+          <Button variant="ghost" size="sm" className="h-8" onClick={resetAdvancedFilters}>
+            <FilterXIcon className="size-3.5" />
+            清除筛选
+          </Button>
+        ) : null}
+      </div>
+
       <div className="flex flex-wrap items-center gap-2">
         <span className="text-sm text-muted-foreground">已选 {selectedFlows.size} 条流量</span>
         <Button variant="outline" size="sm" disabled={selectedFlows.size === 0} onClick={() => setLinking(true)}>
@@ -459,13 +591,35 @@ export default function TrafficPage() {
                       }
                     />
                   </TableHead>
-                  <TableHead className="w-36">时间</TableHead>
+                  <SortableHead
+                    field="ts"
+                    label="时间"
+                    activeField={sort.field}
+                    direction={sort.direction}
+                    onSort={toggleSort}
+                    className="w-36"
+                  />
                   <TableHead className="w-44">host</TableHead>
                   <TableHead className="w-20">方法</TableHead>
                   <TableHead>URL</TableHead>
-                  <TableHead className="w-20">状态码</TableHead>
+                  <SortableHead
+                    field="status"
+                    label="状态码"
+                    activeField={sort.field}
+                    direction={sort.direction}
+                    onSort={toggleSort}
+                    className="w-20"
+                  />
                   <TableHead className="w-36">content-type</TableHead>
-                  <TableHead className="w-24 text-right">响应长度</TableHead>
+                  <SortableHead
+                    field="resp_len"
+                    label="响应长度"
+                    activeField={sort.field}
+                    direction={sort.direction}
+                    onSort={toggleSort}
+                    align="right"
+                    className="w-24 text-right"
+                  />
                 </TableRow>
               </TableHeader>
               <TableBody>

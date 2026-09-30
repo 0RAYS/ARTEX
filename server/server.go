@@ -25,6 +25,7 @@ import (
 	"github.com/Autumn-27/artex/llmpool"
 	"github.com/Autumn-27/artex/llmrec"
 	"github.com/Autumn-27/artex/report"
+	"github.com/Autumn-27/artex/traffic"
 	"github.com/Autumn-27/norma/llm"
 	actool "github.com/Autumn-27/norma/tool"
 	"github.com/Autumn-27/norma/transcript"
@@ -3085,7 +3086,18 @@ func (s *Server) getTraffic(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 	page := atoiDefault(q.Get("page"), 0)
 	size := atoiDefault(q.Get("size"), 100)
-	ex, matched, _ := tr.Page(q.Get("host"), q.Get("method"), q.Get("q"), page, size)
+	ex, matched, _ := tr.Page(traffic.PageQuery{
+		Host:    q.Get("host"),
+		Method:  q.Get("method"),
+		Query:   q.Get("q"),
+		Body:    q.Get("body"),
+		Path:    q.Get("path"),
+		Status:  q.Get("status"),
+		RespMin: int64(atoiDefault(q.Get("resp_min"), -1)),
+		RespMax: int64(atoiDefault(q.Get("resp_max"), -1)),
+		Sort:    q.Get("sort"),
+		Order:   q.Get("order"),
+	}, page, size)
 	count, _ := tr.Count() // global total, for the stat card
 	writeJSON(w, 200, map[string]any{
 		"enabled":   s.m.TrafficEnabled(), // reflect the capture toggle
