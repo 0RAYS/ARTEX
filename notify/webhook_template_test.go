@@ -80,7 +80,7 @@ func TestTemplateRenderFailsPermanently(t *testing.T) {
 		t.Fatal("模板语法错误应在保存时就被拦下")
 	}
 	// 即便绕过校验直接投递，也必须判永久失败而不是反复重试。
-	err := (webhookChannel{}).Send(context.Background(), cfg, singleMsg())
+	_, err := (webhookChannel{}).Send(context.Background(), cfg, singleMsg())
 	if err == nil || !IsPermanent(err) {
 		t.Fatalf("坏模板应判永久失败，得到 %v", err)
 	}
@@ -96,7 +96,7 @@ func TestTemplateCanOnlyProduceJSON(t *testing.T) {
 	}
 	// 渲染出非 JSON 时必须拒绝（而不是原样发出去）。
 	bad := map[string]any{"url": "http://127.0.0.1:1/hook", "body_template": `not json {{.Count}}`}
-	err := (webhookChannel{}).Send(context.Background(), bad, singleMsg())
+	_, err := (webhookChannel{}).Send(context.Background(), bad, singleMsg())
 	if err == nil || !IsPermanent(err) {
 		t.Fatalf("渲染出非 JSON 应判永久失败，得到 %v", err)
 	}

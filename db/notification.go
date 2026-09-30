@@ -128,12 +128,17 @@ func (d *DB) SaveNotificationChannel(ctx context.Context, c *NotificationChannel
 	if c.Mode == "" {
 		c.Mode = NotifyModeRealtime
 	}
-	if c.RatePerMin <= 0 {
-		// 0 表示不限流，是合法配置；但未指定时给一个安全默认值，
-		// 避免新渠道默认就把平台打限流。
-		if ch, ok := notify.Get(c.Kind); ok {
-			c.RatePerMin = ch.DefaultRatePerMin()
-		}
+	// 这里刻意**不**对 0 做任何加工：0 是合法配置，含义是「不限流」。
+	//
+	// 曾经写成 `if c.RatePerMin <= 0 { c.RatePerMin = 默认值 }`，本意是「未指定时
+	// 给个安全默认」，但那把「显式设成 0」也一起吞掉了——文档、UI 提示与
+	// takeTokens 都把 0 解释为不限流，唯独这里悄悄改成 20（钉钉/企微/Telegram）
+	// 或 100（飞书），操作者以为放开了限流、实际被 20/分钟卡着且没有任何提示。
+	//
+	// 「未指定」与「显式 0」的区别只有调用方知道（请求体里字段缺省 vs 明确传 0），
+	// 所以默认值由 server 层在字段缺省时填，见 notifyCreateChannel。
+	if c.RatePerMin < 0 {
+		return 0, errors.New("限流值不能为负")
 	}
 	if c.Config == nil {
 		c.Config = json.RawMessage(`{}`)

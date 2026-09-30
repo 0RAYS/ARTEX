@@ -34,6 +34,10 @@ func (emailChannel) DefaultRatePerMin() int { return 60 }
 // 只掩码密码。SMTP 主机、账号、收件人都不算秘密，掩码它们只会让编辑变麻烦。
 func (emailChannel) SecretKeys() []string { return []string{"password"} }
 
+// host/port 决定把密码交给哪台服务器；tls 决定是否加密传输。三者任一变化都
+// 要求重新表态密码——顺带让「关掉 TLS」这一步必须显式带上凭据，而不是顺手一改。
+func (emailChannel) DestinationKeys() []string { return []string{"host", "port", "tls"} }
+
 func (emailChannel) Validate(cfg map[string]any) error {
 	if cfgString(cfg, "host") == "" {
 		return errors.New("缺少 SMTP 服务器地址")
@@ -51,9 +55,9 @@ func (emailChannel) Validate(cfg map[string]any) error {
 	return nil
 }
 
-func (c emailChannel) Send(ctx context.Context, cfg map[string]any, m Message) error {
+func (c emailChannel) Send(ctx context.Context, cfg map[string]any, m Message) (int, error) {
 	if err := c.Validate(cfg); err != nil {
-		return Permanent(err)
+		return 0, Permanent(err)
 	}
 	host := cfgString(cfg, "host")
 	port := cfgInt(cfg, "port")
@@ -65,13 +69,13 @@ func (c emailChannel) Send(ctx context.Context, cfg map[string]any, m Message) e
 
 	msg, err := buildEmailMessage(from, to, m)
 	if err != nil {
-		return Permanent(err)
+		return 0, Permanent(err)
 	}
 
 	addr := net.JoinHostPort(host, strconv.Itoa(port))
 	client, err := emailDial(ctx, addr, host, implicitTLS)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	defer client.Close()
 
@@ -79,7 +83,7 @@ func (c emailChannel) Send(ctx context.Context, cfg map[string]any, m Message) e
 	if !implicitTLS {
 		if ok, _ := client.Extension("STARTTLS"); ok {
 			if err := client.StartTLS(&tls.Config{ServerName: host, MinVersion: tls.VersionTLS12}); err != nil {
-				return fmt.Errorf("STARTTLS 失败: %w", err)
+				return 0, fmt.Errorf("STARTTLS 失败: %w", err)
 			}
 		}
 	}
@@ -89,32 +93,33 @@ func (c emailChannel) Send(ctx context.Context, cfg map[string]any, m Message) e
 			// 这是**正确**的安全行为，不能绕过，但需要把原因翻译清楚——
 			// 否则使用者只会看到「unencrypted connection」而不知道该怎么办。
 			if strings.Contains(err.Error(), "unencrypted connection") {
-				return Permanent(fmt.Errorf("拒发凭据：连接未加密。请启用 TLS，或改用 465 端口(隐式 TLS)，或把「启用 TLS」勾上 (%w)", err))
+				return 0, Permanent(fmt.Errorf("拒发凭据：连接未加密。请启用 TLS，或改用 465 端口(隐式 TLS)，或把「启用 TLS」勾上 (%w)", err))
 			}
-			return Permanent(fmt.Errorf("SMTP 认证失败: %w", err))
+			return 0, Permanent(fmt.Errorf("SMTP 认证失败: %w", err))
 		}
 	}
 	if err := client.Mail(from); err != nil {
-		return smtpStageError(fmt.Sprintf("发件人 %s 被拒", from), err)
+		return 0, smtpStageError(fmt.Sprintf("发件人 %s 被拒", from), err)
 	}
 	for _, rcpt := range to {
 		if err := client.Rcpt(rcpt); err != nil {
-			return smtpStageError(fmt.Sprintf("收件人 %s 被拒", rcpt), err)
+			return 0, smtpStageError(fmt.Sprintf("收件人 %s 被拒", rcpt), err)
 		}
 	}
 	w, err := client.Data()
 	if err != nil {
-		return fmt.Errorf("SMTP DATA 失败: %w", err)
+		return 0, fmt.Errorf("SMTP DATA 失败: %w", err)
 	}
 	if _, err := w.Write([]byte(msg)); err != nil {
-		return fmt.Errorf("写入邮件正文失败: %w", err)
+		return 0, fmt.Errorf("写入邮件正文失败: %w", err)
 	}
 	if err := w.Close(); err != nil {
-		return fmt.Errorf("提交邮件失败: %w", err)
+		return 0, fmt.Errorf("提交邮件失败: %w", err)
 	}
 	// Quit 失败不影响「邮件已被服务器接收」这个事实，因此忽略其错误。
 	_ = client.Quit()
-	return nil
+	// 邮件没有长度截断（HTML 正文全部发送），整批都算送达。
+	return len(m.Items), nil
 }
 
 // emailDial 建立 SMTP 连接。

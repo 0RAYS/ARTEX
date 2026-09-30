@@ -45,6 +45,10 @@ type notifyFixture struct {
 
 func newNotifyFixture(t *testing.T) *notifyFixture {
 	t.Helper()
+	// 本文件的所有假接收端都跑在 127.0.0.1 上，而投递默认拒绝环回地址
+	// （防 SSRF 打到同机服务与云元数据）。测试显式打开这个开关；
+	// 守卫「默认拒绝」的行为由 notify 包的 ssrf_test.go 覆盖。
+	t.Setenv(notify.AllowLocalTargetsEnv, "1")
 	s, _, request := trafficEvidenceServer(t)
 	pg := s.m.pg
 
@@ -194,18 +198,22 @@ func (f *fakeWebhook) last(t *testing.T) map[string]any {
 	return f.body(t, f.count()-1)
 }
 
-// markdownText 从钉钉 markdown/actionCard 请求体里取出正文。
+// markdownText 从请求体里取出正文，兼容各家的字段名差异：
+// 钉钉 markdown 用 `text`、ActionCard 用 `text`、企业微信 markdown 用 `content`。
 func markdownText(t *testing.T, body map[string]any) string {
 	t.Helper()
-	if md, ok := body["markdown"].(map[string]any); ok {
-		s, _ := md["text"].(string)
-		return s
+	for _, key := range []string{"markdown", "actionCard"} {
+		section, ok := body[key].(map[string]any)
+		if !ok {
+			continue
+		}
+		for _, field := range []string{"text", "content"} {
+			if s, ok := section[field].(string); ok && s != "" {
+				return s
+			}
+		}
 	}
-	if card, ok := body["actionCard"].(map[string]any); ok {
-		s, _ := card["text"].(string)
-		return s
-	}
-	t.Fatalf("请求体里没有 markdown/actionCard 正文: %v", body)
+	t.Fatalf("请求体里没有可识别的正文: %v", body)
 	return ""
 }
 
@@ -407,14 +415,14 @@ func TestNotifyDigestBatchesMultipleFindingsIntoOneMessage(t *testing.T) {
 	ch := f.channel(t, chID)
 
 	// 未到期：不发。
-	f.n.stepDigest(ctx, ch, "")
+	f.n.stepDigest(ctx, ch, 50, "")
 	if hook.count() != 0 {
 		t.Fatal("汇总批次未到期就发了")
 	}
 
 	// 催老批次后：三条合成一条消息。
 	f.agePendingBatch(t, chID)
-	f.n.stepDigest(ctx, ch, "")
+	f.n.stepDigest(ctx, ch, 50, "")
 	if got := hook.count(); got != 1 {
 		t.Fatalf("三条应汇总成一条消息，实际发了 %d 条", got)
 	}
@@ -713,6 +721,112 @@ func TestNotifyNoDeepLinkWithoutBaseURL(t *testing.T) {
 	}
 }
 
+// TestNotifyDigestSegmentsAndDefersRemainder 是「静默丢失」修复的端到端证据。
+//
+// 汇总消息受渠道长度上限约束（企微 4096 字节），一批装不下时必须**按整条**切分：
+// 装进本条的那些标记已送达，其余回到队列等下一条。曾经的实现是把整批标记
+// 成功——被截掉的那些既不在消息里、也不在失败列表里，投递历史还显示成功，
+// 漏洞就这么没了。
+//
+// 断言四件事：① 只标记了实际装下的条数 ② 其余仍是待发 ③ 被推迟的条目
+// **没有消耗重试次数** ④ 再跑一轮能把剩下的发出去（不会卡死）。
+func TestNotifyDigestSegmentsAndDefersRemainder(t *testing.T) {
+	f := newNotifyFixture(t)
+	hook := newFakeWebhook(t)
+	// 用企业微信：markdown 上限 4096 字节，是六个渠道里最紧的。
+	chID := f.createChannel(t, map[string]any{
+		"name":   "分段汇总",
+		"kind":   notify.KindWeCom,
+		"mode":   db.NotifyModeDigest,
+		"config": map[string]any{"webhook": hook.URL},
+	})
+	const total = 60
+	// 标题取长一点，保证 60 条远超 4096 字节，必然分段。
+	longName := strings.Repeat("超长漏洞名称", 6)
+	for i := 0; i < total; i++ {
+		f.record(t, longName+strconv.Itoa(i+1), "high")
+	}
+	ctx := context.Background()
+	if _, _, err := f.pg.FanOutPendingEvents(ctx, 500); err != nil {
+		t.Fatal(err)
+	}
+	f.agePendingBatch(t, chID)
+	ch := f.channel(t, chID)
+
+	f.n.stepDigest(ctx, ch, 50, "")
+	if hook.count() != 1 {
+		t.Fatalf("应只发出一条消息，得到 %d", hook.count())
+	}
+
+	var sent, pending int
+	if err := f.pg.QueryRow(`SELECT
+    count(*) FILTER (WHERE state=$2),
+    count(*) FILTER (WHERE state=$3)
+  FROM notification_deliveries WHERE channel_id=$1`, chID, db.NotifyStateSent, db.NotifyStatePending).
+		Scan(&sent, &pending); err != nil {
+		t.Fatal(err)
+	}
+	if sent == 0 {
+		t.Fatal("应有条目被标记为已送达")
+	}
+	if pending == 0 {
+		t.Fatalf("一批 %d 条不可能全装进 4096 字节，应有剩余待发；sent=%d", total, sent)
+	}
+	if sent+pending != total {
+		t.Fatalf("条目数对不上：sent=%d pending=%d total=%d（既没送达也没待发=丢失）", sent, pending, total)
+	}
+	// 消息正文必须如实告知还有多少条没包含在本条里。
+	if text := markdownText(t, hook.last(t)); !strings.Contains(text, "其余") {
+		t.Fatalf("消息应说明还有条目未包含在本条:\n%.400s", text)
+	}
+
+	// 被推迟的条目不得消耗重试预算：领取时 attempts 已乐观 +1，推迟时要减回去。
+	var maxAttempts int
+	if err := f.pg.QueryRow(`SELECT COALESCE(max(attempts),0) FROM notification_deliveries
+WHERE channel_id=$1 AND state=$2`, chID, db.NotifyStatePending).Scan(&maxAttempts); err != nil {
+		t.Fatal(err)
+	}
+	if maxAttempts > 0 {
+		t.Fatalf("被推迟的条目不该消耗重试次数（否则几条之后就会被判失败），得到 attempts=%d", maxAttempts)
+	}
+
+	// 反复跑直到收敛。断言的是**最终全部送达**且中途确实分了多轮——
+	// 这比「第二轮发完」更强：它证明分段不会卡死、也不会把剩余条目丢掉。
+	rounds := 0
+	for {
+		var undelivered int
+		if err := f.pg.QueryRow(`SELECT count(*) FROM notification_deliveries
+WHERE channel_id=$1 AND state <> $2 AND state <> $3`, chID, db.NotifyStateSent, db.NotifyStateFailed).
+			Scan(&undelivered); err != nil {
+			t.Fatal(err)
+		}
+		if undelivered == 0 {
+			break
+		}
+		rounds++
+		if rounds > total+5 {
+			t.Fatalf("分段投递不收敛：跑了 %d 轮仍有 %d 条悬而未决", rounds, undelivered)
+		}
+		before := hook.count()
+		f.n.stepDigest(ctx, ch, 50, "")
+		if hook.count() == before {
+			t.Fatalf("第 %d 轮没有任何进展，剩余 %d 条会永久卡住", rounds, undelivered)
+		}
+	}
+	if rounds < 2 {
+		t.Fatalf("一条 4096 字节的消息装不下 %d 条长标题漏洞，应分多轮发出，实际只用了 %d 轮", total, rounds)
+	}
+	// 首轮之后的每一轮都应是**纯续发**，不存在被渠道拒绝的条目。
+	var failed int
+	if err := f.pg.QueryRow(`SELECT count(*) FROM notification_deliveries WHERE channel_id=$1 AND state=$2`,
+		chID, db.NotifyStateFailed).Scan(&failed); err != nil {
+		t.Fatal(err)
+	}
+	if failed != 0 {
+		t.Fatalf("假接收端始终返回成功，不该有失败条目，得到 %d", failed)
+	}
+}
+
 // TestNotifyBackoffTableMatchesAttemptBudget 是防漂移断言。
 //
 // 重试预算（db.MaxNotifyAttempts）与退避序列表（notifyBackoff）分居两个包：
@@ -761,5 +875,21 @@ func TestNotifyRateLimitDoesNotConsumeRetryBudget(t *testing.T) {
 	// 渠道之间的令牌桶互相独立。
 	if got := n.takeTokens(1, 1, now.Add(time.Millisecond)); got != 0 {
 		t.Fatalf("渠道 1 的桶应仍然为空，得到 %d", got)
+	}
+}
+
+// TestNotifyTickBudgetFitsWithinLease 是又一条防漂移断言。
+//
+// 单渠道每轮的投递条数上限（notifyMaxSendsPerChannelPerTick）是从租约时长倒推的：
+// 一轮里串行投递的最坏耗时必须 < 租约，否则后几条还没发完租约就过期，
+// 多实例部署时对端会把它们重新领走、重复发送。这三个常量分处不同位置，
+// 改任意一个都可能打破关系而不会有任何报错——所以在这里钉死。
+func TestNotifyTickBudgetFitsWithinLease(t *testing.T) {
+	worst := time.Duration(notifyMaxSendsPerChannelPerTick) * notifySendTimeout
+	if worst >= notifyLease {
+		t.Fatalf("单渠道一轮的最坏耗时 %v 不应达到或超过租约 %v"+
+			"（notifyMaxSendsPerChannelPerTick=%d × notifySendTimeout=%v）——"+
+			"改这三个常量中的任意一个都要同步检查另外两个",
+			worst, notifyLease, notifyMaxSendsPerChannelPerTick, notifySendTimeout)
 	}
 }

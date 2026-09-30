@@ -78,8 +78,51 @@ func TruncateHTML(s string, max int) string {
 	if lt := strings.LastIndex(cut, "<"); lt >= 0 && !strings.Contains(cut[lt:], ">") {
 		cut = cut[:lt]
 	}
+	// 尾部若是被切断的 HTML 实体（如 `&amp;` 被切成 `&amp`），同样要退回去。
+	// 实体残片在一个只认实体的解析器里可能让**整条消息**被拒收——一条超过
+	// 长度上限的汇总消息本来就常见，不值得为此丢掉整条通知。
+	if amp := strings.LastIndex(cut, "&"); amp >= 0 && !strings.Contains(cut[amp:], ";") {
+		cut = cut[:amp]
+	}
 	return cut
 }
+
+// packItemCount 计算在预算内能**完整**放下多少条，供汇总消息按整条打包。
+//
+// 为什么要按整条而不是渲染完整篇再截断：截断会让后半截条目凭空消失，
+// 而它们的投递记录仍会被标记为已送达——消息里看不出来、投递历史里也看不出来，
+// 漏洞就这么没了。按整条打包后，装不下的条目留在库里成为下一批，
+// 调用方拿到的 kept 就是本条消息真正送达的条数。
+//
+// 参数：maxSize<=0 表示不限制；reserve 是给消息头部/尾部预留的量；
+// size 负责计量（各平台口径不同：企微/钉钉按字节，Telegram 按字符数——
+// 用错口径不会报错，只会让中文消息被压到远小于上限）；
+// render 把第 idx 条渲染成它的实际文本——长度因内容而异，不能靠估算。
+//
+// 至少返回 1（只要还有条目）。单条极端超长时也要发出这一条、由调用方的
+// 最终截断兜底，否则一条超长漏洞会把整批永久卡在原地。
+func packItemCount(items []Item, maxSize, reserve int, footer string, size func(string) int, render func(Item, int) string) int {
+	if maxSize <= 0 {
+		return len(items)
+	}
+	budget := maxSize - reserve - size(footer)
+	if budget < 0 {
+		budget = 0
+	}
+	used := 0
+	for i, it := range items {
+		used += size(render(it, i))
+		if used > budget && i > 0 {
+			return i
+		}
+	}
+	return len(items)
+}
+
+// byteSize / runeSize 是 packItemCount 的两种计量口径，命名出来避免调用处
+// 出现裸的 func(s string) int 闭包，否则很难一眼看出用的是哪种口径。
+func byteSize(s string) int { return len(s) }
+func runeSize(s string) int { return utf8.RuneCountInString(s) }
 
 // assetLine 把资产列表渲染成一行展示文本，超过 limit 个时省略其余并标注总数。
 // 一个漏洞可能锚定几十个资产，全列出来会挤爆消息。

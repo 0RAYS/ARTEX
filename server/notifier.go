@@ -42,6 +42,22 @@ const (
 	// 存在的意义是防止「一个渠道配成不限流 + 一次扫出上千条漏洞」把
 	// 单轮循环拖成长时间阻塞。
 	notifyUnlimitedBurstPerTick = 50
+	// notifyMaxSendsPerChannelPerTick 是单渠道每轮最多投递几条。
+	//
+	// 这个上限由**租约时长**倒推：领取时给行打的是租约（notifyLease = 3 分钟），
+	// 若一轮里串行投递的条数多到最坏耗时超过租约，后几条还没发完租约就过期了。
+	// 单进程内无所谓（Run 是单个 goroutine 串行跑，tick 不会重入），但**两个
+	// 进程连同一个库**时，对端会把租约过期的行重新领走并重复发送，还会把
+	// attempts 双份递增、在原进程仍在投递时就判成失败。
+	//
+	// 取值：3 分钟租约 / 30 秒单次超时 = 6 是**刚好用满租约**、零余量，
+	// 不能取；取 5 让最坏耗时 150 秒留出 30 秒余量。这个关系由
+	// TestNotifyTickBudgetFitsWithinLease 钉死——改 notifyLease、
+	// notifySendTimeout 或本值中的任意一个都会让那条断言失败。
+	notifyMaxSendsPerChannelPerTick = 5
+	// notifySendTimeout 是单次投递的超时。它同时决定上一条常量的取值，
+	// 两者相乘不能超过 notifyLease，见 TestNotifyTickBudgetFitsWithinLease。
+	notifySendTimeout = 30 * time.Second
 )
 
 // notifyBackoff 是失败重试的退避序列，下标为已尝试次数。
@@ -123,11 +139,15 @@ func (n *Notifier) step(ctx context.Context) {
 		// 先问令牌桶这一轮还能发几条，再按这个数量去领——顺序不能反，
 		// 否则被限流挡下的投递已经消耗过重试次数。
 		allow := n.takeTokens(ch.ID, ch.RatePerMin, time.Now())
+		if allow > notifyMaxSendsPerChannelPerTick {
+			allow = notifyMaxSendsPerChannelPerTick
+		}
 		if allow <= 0 {
 			continue
 		}
 		if ch.Mode == db.NotifyModeDigest {
-			n.stepDigest(ctx, ch, baseURL)
+			// 汇总也受同一份额度约束：领到的条数不能超过本轮令牌数。
+			n.stepDigest(ctx, ch, allow, baseURL)
 			continue
 		}
 		n.stepRealtime(ctx, ch, allow, baseURL)
@@ -161,7 +181,7 @@ func (n *Notifier) stepRealtime(ctx context.Context, ch *db.NotificationChannel,
 }
 
 // stepDigest 在批次到期时把某渠道的待发投递聚合成一条消息发出。
-func (n *Notifier) stepDigest(ctx context.Context, ch *db.NotificationChannel, baseURL string) {
+func (n *Notifier) stepDigest(ctx context.Context, ch *db.NotificationChannel, allow int, baseURL string) {
 	window := n.digestInterval()
 	due, err := n.pg.DigestBatchDue(ctx, ch.ID, window)
 	if err != nil {
@@ -171,7 +191,7 @@ func (n *Notifier) stepDigest(ctx context.Context, ch *db.NotificationChannel, b
 	if !due {
 		return
 	}
-	deliveries, err := n.pg.ClaimDigestBatch(ctx, ch.ID, notifyLease)
+	deliveries, err := n.pg.ClaimDigestBatch(ctx, ch.ID, allow, notifyLease)
 	if err != nil {
 		log.Printf("[notify] 领取汇总批次失败 channel=%d: %v", ch.ID, err)
 		return
@@ -184,49 +204,127 @@ func (n *Notifier) stepDigest(ctx context.Context, ch *db.NotificationChannel, b
 		_ = n.pg.FailDeliveries(ctx, deliveryIDs(deliveries), fmt.Sprintf("渠道类型 %q 未注册", ch.Kind))
 		return
 	}
-	msg, err := n.renderBatch(ctx, deliveries, baseURL, int(window.Minutes()))
+	msg, included, err := n.renderBatch(ctx, deliveries, baseURL, int(window.Minutes()))
 	if err != nil {
 		_ = n.pg.FailDeliveries(ctx, deliveryIDs(deliveries), err.Error())
 		return
 	}
-	n.send(ctx, channel, cfg, msg, deliveries)
+	// 快照坏掉、没能进消息的那些投递要显式判失败。不这么做的话它们会留在
+	// included 之外、既不进消息也不进失败列表——发送成功时它们的状态会被
+	// 之后的批量标记漏掉，永远停在 sending 直到租约过期被反复领取。
+	if skipped := excludeDeliveries(deliveries, included); len(skipped) > 0 {
+		reason := "事件快照无法解析，本条漏洞无法渲染成消息"
+		if fErr := n.pg.FailDeliveries(ctx, deliveryIDs(skipped), reason); fErr != nil {
+			log.Printf("[notify] 标记坏快照投递失败 channel=%s ids=%v: %v", ch.Kind, deliveryIDs(skipped), fErr)
+		}
+		log.Printf("[notify] 跳过 %d 条快照无法解析的投递 channel=%d", len(skipped), ch.ID)
+	}
+	// 只把进了消息的那些交给 send：included[i] 与 msg.Items[i] 严格对应，
+	// send 依赖这个对应关系把「渠道回报装下了前 K 条」落到正确的投递行上。
+	n.send(ctx, channel, cfg, msg, included)
 }
 
 // send 投递并按结果流转状态。
 //
-// 同一批投递（汇总模式下可能几十条）共享一个发送结果：要么整批送达、要么整批
-// 重试。不做逐条重试——汇总消息是一条，重发其中一部分会让批次语义错乱。
+// 同一批投递（汇总模式下可能几十条）共享一个发送结果：要么送达、要么整批重试。
+// 不做逐条重试——汇总消息是一条，重发其中一部分会让批次语义错乱。
+//
+// 唯一的例外是**渠道长度上限导致的分段**：渠道回报实际只装下了前 K 条，
+// 那么第 K+1 条起必须留到下一批，而不是跟着一起被标记成功。否则被截掉的
+// 那些漏洞既不在消息里、也不在失败列表里，彻底消失。
 func (n *Notifier) send(ctx context.Context, channel notify.Channel, cfg map[string]any, msg notify.Message, deliveries []*db.NotificationDelivery) {
-	ids := deliveryIDs(deliveries)
-	attempts := maxAttempts(deliveries)
-
 	// 单次投递设上限，避免某个渠道卡住把这一轮剩余渠道全部拖住。
-	sendCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	sendCtx, cancel := context.WithTimeout(ctx, notifySendTimeout)
 	defer cancel()
-	err := channel.Send(sendCtx, cfg, msg)
+	delivered, err := channel.Send(sendCtx, cfg, msg)
+	if err == nil && delivered > 0 {
+		if delivered > len(deliveries) {
+			// 渠道回报的条数不可能超过投递数；真发生了说明渲染层算错了，
+			// 按全部送达处理并把问题记下来，总好过把记录写乱。
+			log.Printf("[notify] 渠道回报送达条数 %d 超过投递数 %d channel=%s，按全部送达处理",
+				delivered, len(deliveries), channel.Kind())
+			delivered = len(deliveries)
+		}
+		sent, rest := deliveries[:delivered], deliveries[delivered:]
+		if err := n.pg.MarkDeliveriesSent(ctx, deliveryIDs(sent)); err != nil {
+			log.Printf("[notify] 标记已送达失败 channel=%s ids=%v: %v", channel.Kind(), deliveryIDs(sent), err)
+		}
+		if len(rest) > 0 {
+			// 本条消息已达渠道长度上限：剩下的立刻回队，由下一个 tick 续发。
+			// 用 DeferDeliveries 而非 RescheduleDeliveries —— 这不是失败，
+			// 不该消耗重试预算（领取时已经乐观 +1 了，那里会减回去）。
+			if err := n.pg.DeferDeliveries(ctx, deliveryIDs(rest),
+				fmt.Sprintf("本条消息已达渠道长度上限，仅送达前 %d 条，其余留待下一批", delivered)); err != nil {
+				log.Printf("[notify] 分段续发排队失败 channel=%s ids=%v: %v", channel.Kind(), deliveryIDs(rest), err)
+			}
+		}
+		return
+	}
 	if err == nil {
-		if err := n.pg.MarkDeliveriesSent(ctx, ids); err != nil {
-			log.Printf("[notify] 标记已送达失败 channel=%s ids=%v: %v", channel.Kind(), ids, err)
-		}
-		return
+		// 渠道既没报错也没说送达了多少条。按失败处理（走退避），
+		// 免得这条投递被反复领取却永远标记不掉。
+		err = fmt.Errorf("渠道未报告送达条数（delivered=%d）", delivered)
 	}
-	// 永久失败与「重试次数用尽」都直接落 failed，等人工在投递历史里重发；
-	// 其余按退避序列重排。
-	if notify.IsPermanent(err) || attempts >= db.MaxNotifyAttempts {
-		reason := err.Error()
-		if !notify.IsPermanent(err) {
-			reason = fmt.Sprintf("重试 %d 次后仍失败: %s", attempts, err)
+
+	// 失败处置**逐条**决定，而不是拿整批的最大尝试次数做判断。
+	//
+	// 曾经是 `if maxAttempts(deliveries) >= MaxNotifyAttempts` 整批判死，但批次里
+	// 各条的尝试次数并不相同：一个已经重试两次的老投递（attempts=2）会把同一批里
+	// 全新的投递（attempts=1）一起拖进 failed——新漏洞一条重试都没用上就永久丢了，
+	// 与「不让老行拖新行下水」的初衷正好相反。
+	permanent := notify.IsPermanent(err)
+	var failIDs, exhaustedIDs []int64
+	byDelay := map[time.Duration][]int64{}
+	for _, dl := range deliveries {
+		switch {
+		case permanent:
+			failIDs = append(failIDs, dl.ID)
+		case dl.Attempts >= db.MaxNotifyAttempts:
+			exhaustedIDs = append(exhaustedIDs, dl.ID)
+		default:
+			delay := notifyBackoff[min(dl.Attempts, len(notifyBackoff)-1)]
+			byDelay[delay] = append(byDelay[delay], dl.ID)
 		}
-		if failErr := n.pg.FailDeliveries(ctx, ids, reason); failErr != nil {
-			log.Printf("[notify] 标记失败状态出错 channel=%s ids=%v: %v", channel.Kind(), ids, failErr)
+	}
+
+	if len(failIDs) > 0 {
+		if fErr := n.pg.FailDeliveries(ctx, failIDs, err.Error()); fErr != nil {
+			log.Printf("[notify] 标记失败状态出错 channel=%s ids=%v: %v", channel.Kind(), failIDs, fErr)
 		}
-		log.Printf("[notify] 投递失败 channel=%d kind=%s ids=%v: %s", deliveries[0].ChannelID, channel.Kind(), ids, reason)
-		return
 	}
-	delay := notifyBackoff[min(attempts, len(notifyBackoff)-1)]
-	if rErr := n.pg.RescheduleDeliveries(ctx, ids, delay, err.Error()); rErr != nil {
-		log.Printf("[notify] 重排投递失败 channel=%s ids=%v: %v", channel.Kind(), ids, rErr)
+	if len(exhaustedIDs) > 0 {
+		reason := fmt.Sprintf("重试 %d 次后仍失败: %s", db.MaxNotifyAttempts, err)
+		if fErr := n.pg.FailDeliveries(ctx, exhaustedIDs, reason); fErr != nil {
+			log.Printf("[notify] 标记失败状态出错 channel=%s ids=%v: %v", channel.Kind(), exhaustedIDs, fErr)
+		}
 	}
+	// 按延迟分组重排：只有 3 档退避，分组数天然很小，不必为每条单独发一次
+	// UPDATE（那会让一个 500 条的批次产生 500 次往返）。
+	for delay, group := range byDelay {
+		if rErr := n.pg.RescheduleDeliveries(ctx, group, delay, err.Error()); rErr != nil {
+			log.Printf("[notify] 重排投递失败 channel=%s ids=%v: %v", channel.Kind(), group, rErr)
+		}
+	}
+	if len(failIDs)+len(exhaustedIDs) > 0 {
+		log.Printf("[notify] 投递失败 channel=%d kind=%s 永久失败=%d 重试耗尽=%d 待重试=%d: %s",
+			deliveries[0].ChannelID, channel.Kind(), len(failIDs), len(exhaustedIDs), len(byDelay), err)
+	}
+}
+
+// excludeDeliveries 返回 all 中不在 keep 里的那些（按指针身份比较）。
+// 用于找出「没能进消息」的投递——它们必须被显式处置，不能留在灰色地带。
+func excludeDeliveries(all, keep []*db.NotificationDelivery) []*db.NotificationDelivery {
+	inKeep := make(map[*db.NotificationDelivery]bool, len(keep))
+	for _, dl := range keep {
+		inKeep[dl] = true
+	}
+	var out []*db.NotificationDelivery
+	for _, dl := range all {
+		if !inKeep[dl] {
+			out = append(out, dl)
+		}
+	}
+	return out
 }
 
 // adapt 取渠道实现并解析其配置。
@@ -263,29 +361,39 @@ func (n *Notifier) renderSingle(ctx context.Context, dl *db.NotificationDelivery
 
 // renderBatch 渲染汇总消息。逐条解析快照——单条坏了只跳过那一条，
 // 不让它把整批汇总拖没。
-func (n *Notifier) renderBatch(ctx context.Context, deliveries []*db.NotificationDelivery, baseURL string, windowMinutes int) (notify.Message, error) {
+//
+// 返回值 included 与 msg.Items **严格一一对应**（第 i 个投递 ↔ 第 i 个条目）。
+// 这个对应关系是硬要求：调用方按「渠道回报装下了前 K 条」来决定前 K 个投递
+// 标记已送达。若这里跳过了坏快照却不把跳过的投递从 included 里剔除，
+// 下标就会错位——本该失败的坏条目会被标成已送达，而好条目被误判为未送达。
+// 坏掉的那些由调用方显式标记失败，见 stepDigest。
+func (n *Notifier) renderBatch(ctx context.Context, deliveries []*db.NotificationDelivery, baseURL string, windowMinutes int) (notify.Message, []*db.NotificationDelivery, error) {
 	items := make([]notify.Item, 0, len(deliveries))
+	included := make([]*db.NotificationDelivery, 0, len(deliveries))
 	for _, dl := range deliveries {
 		snap, err := parseSnapshot(dl)
 		if err != nil {
+			// 坏快照不进消息，也不进 included——它的处置由调用方负责
+			// （显式标记失败，而不是混在「已送达」里蒙混过关）。
 			log.Printf("[notify] 汇总批次中跳过无法解析的快照 delivery=%d: %v", dl.ID, err)
 			continue
 		}
 		item, err := n.itemFor(ctx, snap, baseURL)
 		if err != nil {
-			return notify.Message{}, err
+			return notify.Message{}, nil, err
 		}
 		items = append(items, item)
+		included = append(included, dl)
 	}
 	if len(items) == 0 {
-		return notify.Message{}, fmt.Errorf("汇总批次 %d 条投递全部无法解析", len(deliveries))
+		return notify.Message{}, nil, fmt.Errorf("汇总批次 %d 条投递全部无法解析", len(deliveries))
 	}
 	return notify.Message{
 		Items:         items,
 		Batch:         true,
 		WindowMinutes: windowMinutes,
 		HomeURL:       baseURL,
-	}, nil
+	}, included, nil
 }
 
 // itemFor 把事件快照渲染成待推送条目，顺带解析资产名与详情回链。
@@ -395,18 +503,6 @@ func deliveryIDs(deliveries []*db.NotificationDelivery) []int64 {
 		out = append(out, dl.ID)
 	}
 	return out
-}
-
-// maxAttempts 取批次里最大的已尝试次数。批次会一起成败，用最大值决定是否
-// 还有重试预算，避免新加入的行被老行的次数拖下水（反之亦然）。
-func maxAttempts(deliveries []*db.NotificationDelivery) int {
-	m := 0
-	for _, dl := range deliveries {
-		if dl.Attempts > m {
-			m = dl.Attempts
-		}
-	}
-	return m
 }
 
 func trimTrailingSlash(s string) string {

@@ -28,6 +28,10 @@ func (webhookChannel) DefaultRatePerMin() int { return 0 }
 // 这个取舍是刻意的：宁可多填一次，也不把凭据回显到浏览器。
 func (webhookChannel) SecretKeys() []string { return []string{"url", "headers"} }
 
+// 目的地是 url。改 url 时必须重新表态 headers —— 否则原始 Authorization 头
+// 会被原样发到新地址，这正是掩码绕过的主路径。
+func (webhookChannel) DestinationKeys() []string { return []string{"url"} }
+
 // webhookDefaultTemplate 是未填模板时的兜底请求体：一个直白的 JSON 结构，
 // 覆盖绝大多数「收一条 JSON 入库」的自建接收端。
 const webhookDefaultTemplate = `{
@@ -95,9 +99,9 @@ func (webhookChannel) Validate(cfg map[string]any) error {
 	return nil
 }
 
-func (c webhookChannel) Send(ctx context.Context, cfg map[string]any, m Message) error {
+func (c webhookChannel) Send(ctx context.Context, cfg map[string]any, m Message) (int, error) {
 	if err := c.Validate(cfg); err != nil {
-		return Permanent(err)
+		return 0, Permanent(err)
 	}
 	method := strings.ToUpper(cfgString(cfg, "method"))
 	if method == "" {
@@ -110,12 +114,12 @@ func (c webhookChannel) Send(ctx context.Context, cfg map[string]any, m Message)
 	if method != http.MethodGet {
 		body, err := renderWebhookBody(cfgString(cfg, "body_template"), m)
 		if err != nil {
-			return Permanent(err)
+			return 0, Permanent(err)
 		}
 		// 模板渲染出的是字符串形式的 JSON，这里转成 json.RawMessage 原样发出，
 		// 避免二次转义把用户精心构造的结构套进一个 JSON 字符串里。
 		if !json.Valid([]byte(body)) {
-			return Permanent(errors.New("请求体模板渲染结果不是合法 JSON"))
+			return 0, Permanent(errors.New("请求体模板渲染结果不是合法 JSON"))
 		}
 		payload = json.RawMessage(body)
 	}
@@ -129,9 +133,11 @@ func (c webhookChannel) Send(ctx context.Context, cfg map[string]any, m Message)
 		headers["Content-Type"] = ct
 	}
 	if _, err := doJSON(ctx, method, cfgString(cfg, "url"), headers, payload); err != nil {
-		return err
+		return 0, err
 	}
-	return nil
+	// 通用 Webhook 不截断正文（接收端是用户自己的服务，体积由 body_template 决定），
+	// 因此整批都算送达。
+	return len(m.Items), nil
 }
 
 // renderWebhookBody 用用户模板（或默认模板）渲染请求体。

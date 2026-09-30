@@ -7,11 +7,92 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
+	"os"
 	"strings"
+	"syscall"
 	"time"
 )
+
+// allowLocalTargets 决定是否允许把消息投递到环回 / 链路本地地址。
+//
+// 默认拒绝。这几段地址不是 IM 机器人或公网邮件服务器会出现的地方，而它们能
+// 打到的东西很敏感：同机另一个服务的管理端口、以及云环境的元数据端点
+// （169.254.169.254，可读出实例凭据）。投递地址是管理员配的，但一个被 XSS/CSRF
+// 借用的管理会话、或共用同一 JWT 的第二个人，都能靠改配置把响应内容读回来
+// ——doJSON 会把 4xx/5xx 的响应体前 200 字节写进 last_error，而投递历史接口
+// 会把它回显出来，这就是一条半盲读原语。
+//
+// 但「本机 SMTP 中继」（127.0.0.1:25 上的 postfix）是自建邮件的常见配置，
+// 一刀切会把人卡住。所以留一个显式逃生口而不是硬编码放行：
+// 设置 ARTEX_NOTIFY_ALLOW_LOCAL=1 即允许。
+//
+// 导出为 AllowLocalTargetsEnv 是为了让测试能明确地打开它——本包与 server 包的
+// 用例大量使用 127.0.0.1 上的 httptest 假接收端，不打开就全部被守卫拦下。
+const AllowLocalTargetsEnv = "ARTEX_NOTIFY_ALLOW_LOCAL"
+
+func allowLocalTargets() bool {
+	v := strings.TrimSpace(os.Getenv(AllowLocalTargetsEnv))
+	return v == "1" || strings.EqualFold(v, "true")
+}
+
+// isBlockedDialIP 报告目标 IP 是否属于「默认不允许投递」的地址段。
+//
+// 只拒绝环回、链路本地（含云元数据 169.254.169.254）、未指定与组播。
+// **不拒绝** RFC1918 私网：内网自建 Mattermost / SMTP 中继是很常见的合法用法，
+// 把它们一并挡掉会让功能在真实环境里直接不可用。这条取舍是刻意的——
+// 防护要挡住真正敏感的目标，同时不能把正常部署一起废掉。
+func isBlockedDialIP(ip net.IP) bool {
+	if ip == nil {
+		return true
+	}
+	// IPv4-mapped IPv6（::ffff:127.0.0.1）要还原成 IPv4 再判，否则绕过检查。
+	if v4 := ip.To4(); v4 != nil {
+		ip = v4
+	}
+	return ip.IsLoopback() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() ||
+		ip.IsInterfaceLocalMulticast() || ip.IsUnspecified() || ip.IsMulticast()
+}
+
+// blockInternalDial 是 http.Transport 拨号器的 Control 钩子，在**连接建立时**
+// 检查目标地址。
+//
+// 为什么设在拨号阶段而不是只在保存配置时校验：这里才是最终生效点。
+// 它同时覆盖两种绕过配置校验的情形——DNS 重绑定（校验时解析到公网 IP、
+// 真正连接时解析到内网）与重定向（虽然我们已拒绝跨主机跳转，但同主机跳转
+// 仍可能把路径指到别处）。
+func blockInternalDial(_, address string, _ syscall.RawConn) error {
+	if allowLocalTargets() {
+		return nil
+	}
+	host, _, err := net.SplitHostPort(address)
+	if err != nil {
+		return err
+	}
+	ip := net.ParseIP(host)
+	if ip == nil {
+		return fmt.Errorf("无法解析目标地址 %q", host)
+	}
+	if isBlockedDialIP(ip) {
+		return fmt.Errorf("拒绝投递到本机/链路本地地址 %s（如确需投递到本机服务，设置 %s=1）", ip, AllowLocalTargetsEnv)
+	}
+	return nil
+}
+
+// notifyTransport 在默认 Transport 的基础上只加一个拨号守卫。
+// 用 Clone 保留默认的全部调优（连接池、HTTP/2、超时、proxy 等），
+// 避免为了加一个检查而改动其它行为。
+var notifyTransport = func() *http.Transport {
+	t, ok := http.DefaultTransport.(*http.Transport)
+	if !ok {
+		return &http.Transport{}
+	}
+	clone := t.Clone()
+	clone.DialContext = (&net.Dialer{Timeout: 10 * time.Second, Control: blockInternalDial}).DialContext
+	return clone
+}()
 
 // httpClient 是所有渠道投递共用的客户端。
 //
@@ -24,7 +105,8 @@ import (
 // bot token）**就在 URL 里**，跟随跨主机跳转等于把凭据交给重定向目标。同主机
 // 的跳转（如末尾补斜杠）仍允许。
 var httpClient = &http.Client{
-	Timeout: 15 * time.Second,
+	Timeout:   15 * time.Second,
+	Transport: notifyTransport,
 	CheckRedirect: func(req *http.Request, via []*http.Request) error {
 		if len(via) >= 5 {
 			return errors.New("重定向次数过多")

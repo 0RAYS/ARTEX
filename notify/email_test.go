@@ -156,7 +156,7 @@ func TestEmailSendDeliversFullMessage(t *testing.T) {
 	f.advertiseAuth = true
 	cfg := emailCfg(t, f, map[string]any{"username": "artex", "password": "pw"})
 
-	if err := (emailChannel{}).Send(context.Background(), cfg, singleMsg()); err != nil {
+	if _, err := (emailChannel{}).Send(context.Background(), cfg, singleMsg()); err != nil {
 		t.Fatalf("投递失败: %v", err)
 	}
 	// 信封阶段必须走到：发件人、两个收件人、DATA。
@@ -186,7 +186,7 @@ func TestEmailSendWithoutAuth(t *testing.T) {
 	// 未配账号时不应发 AUTH —— 有些中继会因此拒收。
 	f := newFakeSMTP(t)
 	cfg := emailCfg(t, f, nil)
-	if err := (emailChannel{}).Send(context.Background(), cfg, singleMsg()); err != nil {
+	if _, err := (emailChannel{}).Send(context.Background(), cfg, singleMsg()); err != nil {
 		t.Fatalf("投递失败: %v", err)
 	}
 	if f.sawCommand("AUTH") {
@@ -214,7 +214,7 @@ func TestEmailSendClassifiesSMTPReplies(t *testing.T) {
 			f := newFakeSMTP(t)
 			f.rcptReply = tc.rcptReply
 			f.mailReply = tc.mailReply
-			err := (emailChannel{}).Send(context.Background(), emailCfg(t, f, nil), singleMsg())
+			_, err := (emailChannel{}).Send(context.Background(), emailCfg(t, f, nil), singleMsg())
 			if err == nil {
 				t.Fatal("应报错")
 			}
@@ -244,7 +244,7 @@ func TestEmailSendRefusesPlaintextCredentials(t *testing.T) {
 		"username": "artex",
 		"password": "pw",
 	}
-	err := (emailChannel{}).Send(context.Background(), cfg, singleMsg())
+	_, err := (emailChannel{}).Send(context.Background(), cfg, singleMsg())
 	if err == nil {
 		t.Skip("本机 DNS 解析到了本地服务器，跳过（不影响其它用例）")
 	}

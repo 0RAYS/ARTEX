@@ -28,6 +28,9 @@ func (feishuChannel) DefaultRatePerMin() int { return 100 }
 // Webhook 地址末段即机器人唯一标识，属凭据。
 func (feishuChannel) SecretKeys() []string { return []string{"webhook", "secret"} }
 
+// 同理：改 Webhook 地址必须对新地址重新表态签名密钥。
+func (feishuChannel) DestinationKeys() []string { return []string{"webhook"} }
+
 func (feishuChannel) Validate(cfg map[string]any) error {
 	hook := cfgString(cfg, "webhook")
 	if hook == "" {
@@ -39,13 +42,14 @@ func (feishuChannel) Validate(cfg map[string]any) error {
 	return nil
 }
 
-func (c feishuChannel) Send(ctx context.Context, cfg map[string]any, m Message) error {
+func (c feishuChannel) Send(ctx context.Context, cfg map[string]any, m Message) (int, error) {
 	if err := c.Validate(cfg); err != nil {
-		return Permanent(err)
+		return 0, Permanent(err)
 	}
+	card, kept := feishuCard(m)
 	payload := map[string]any{
 		"msg_type": "interactive",
-		"card":     feishuCard(m),
+		"card":     card,
 	}
 	// 加签参数与消息同层，且只在配置了 secret 时出现。
 	if secret := cfgString(cfg, "secret"); secret != "" {
@@ -55,7 +59,7 @@ func (c feishuChannel) Send(ctx context.Context, cfg map[string]any, m Message) 
 	}
 	raw, err := doJSON(ctx, "POST", cfgString(cfg, "webhook"), nil, payload)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	var res struct {
 		Code int    `json:"code"`
@@ -65,15 +69,15 @@ func (c feishuChannel) Send(ctx context.Context, cfg map[string]any, m Message) 
 		StatusMessage string `json:"StatusMessage"`
 	}
 	if err := json.Unmarshal(raw, &res); err != nil {
-		return fmt.Errorf("解析飞书响应失败: %w (%s)", err, snippet(raw))
+		return 0, fmt.Errorf("解析飞书响应失败: %w (%s)", err, snippet(raw))
 	}
 	if res.Code != 0 {
-		return Permanent(fmt.Errorf("飞书返回错误 %d: %s", res.Code, res.Msg))
+		return 0, Permanent(fmt.Errorf("飞书返回错误 %d: %s", res.Code, res.Msg))
 	}
 	if res.StatusCode != 0 {
-		return Permanent(fmt.Errorf("飞书返回错误 %d: %s", res.StatusCode, res.StatusMessage))
+		return 0, Permanent(fmt.Errorf("飞书返回错误 %d: %s", res.StatusCode, res.StatusMessage))
 	}
-	return nil
+	return kept, nil
 }
 
 // feishuSign 按飞书官方规则计算签名。
@@ -108,18 +112,31 @@ func feishuSeverityTemplate(severity string) string {
 	}
 }
 
-// feishuCard 构造交互式卡片。
-func feishuCard(m Message) map[string]any {
+// feishuMaxCardBytes 是卡片内容的保守上限。飞书对卡片有体积限制，超了整条被拒；
+// 取一个明显低于官方上限的值，把 JSON 包装开销也算进来。
+const feishuMaxCardBytes = 24000
+
+// feishuCard 构造交互式卡片，返回卡片与**实际写入的条目数**。
+// kept 的用途同 markdownBody：只有真正进了卡片的条目才该被标记为已送达。
+func feishuCard(m Message) (map[string]any, int) {
 	elements := []any{}
+	kept := 0
 	if m.Batch {
-		elements = append(elements, feishuMarkdownDiv(markdownBatchIntro(m)))
-		for i, it := range m.Items {
+		// 先按整条打包再拼头部：头部要写「其余 N 条将在下一条消息继续」，
+		// N 必须来自实际装下的条数。
+		kept = packItemCount(m.Items, feishuMaxCardBytes, markdownReservedBytes, "", byteSize, func(it Item, idx int) string {
+			return feishuBatchLine(it, idx+1)
+		})
+		items := m.Items[:kept]
+		elements = append(elements, feishuMarkdownDiv(markdownBatchIntro(m, items, len(m.Items))))
+		for i, it := range items {
 			elements = append(elements, feishuMarkdownDiv(feishuBatchLine(it, i+1)))
 		}
 		if m.HomeURL != "" {
 			elements = append(elements, feishuButton("在平台中查看全部", m.HomeURL))
 		}
 	} else if len(m.Items) > 0 {
+		kept = 1
 		it := m.Items[0]
 		elements = append(elements, feishuMarkdownDiv(feishuItemLines(it)))
 		if it.DetailURL != "" {
@@ -135,7 +152,7 @@ func feishuCard(m Message) map[string]any {
 	if len(m.Items) > 0 {
 		card["header"].(map[string]any)["template"] = feishuSeverityTemplate(m.Items[0].Severity)
 	}
-	return card
+	return card, kept
 }
 
 func feishuMarkdownDiv(content string) map[string]any {
@@ -155,28 +172,35 @@ func feishuButton(label, url string) map[string]any {
 }
 
 // feishuItemLines 渲染单个漏洞的 lark_md 正文。
+//
+// lark_md 与 markdown 是同族的文本格式，同样会解析链接与强调，所以来自外部
+// 的字段一律过 markdownText（单行化 + 转义）——否则一条漏洞标题就能在
+// 飞书里变成可点击的外链。
 func feishuItemLines(it Item) string {
-	out := fmt.Sprintf("**%s · %s**", SeverityLabel(it.Severity), it.Title())
+	out := fmt.Sprintf("**%s · %s**", SeverityLabel(it.Severity), markdownText(it.Title(), 0))
 	if it.IsStatusChange() {
-		out += fmt.Sprintf("\n**状态变更**：%s → %s", StatusLabel(it.FromStatus), StatusLabel(it.ToStatus))
+		out += fmt.Sprintf("\n**状态变更**：%s → %s",
+			markdownText(StatusLabel(it.FromStatus), 0), markdownText(StatusLabel(it.ToStatus), 0))
 	}
 	if it.VulnClass != "" && it.VulnClass != it.Title() {
-		out += fmt.Sprintf("\n**类型**：%s", it.VulnClass)
+		out += fmt.Sprintf("\n**类型**：%s", markdownText(it.VulnClass, 0))
 	}
 	if a := assetLine(it.Assets, maxAssetsShown); a != "" {
-		out += fmt.Sprintf("\n**资产**：%s", a)
+		out += fmt.Sprintf("\n**资产**：%s", markdownText(a, 0))
 	}
-	if s := OneLine(it.Summary, maxSummaryRunes); s != "" {
-		out += fmt.Sprintf("\n**摘要**：%s", s)
+	if it.Summary != "" {
+		if s := markdownText(it.Summary, maxSummaryRunes); s != "" {
+			out += fmt.Sprintf("\n**摘要**：%s", s)
+		}
 	}
 	return out
 }
 
 // feishuBatchLine 渲染汇总卡片里的一条。
 func feishuBatchLine(it Item, index int) string {
-	line := fmt.Sprintf("**%d. %s · %s**", index, SeverityLabel(it.Severity), it.Title())
+	line := fmt.Sprintf("**%d. %s · %s**", index, SeverityLabel(it.Severity), markdownText(it.Title(), 0))
 	if a := assetLine(it.Assets, maxAssetsShown); a != "" {
-		line += " — " + a
+		line += " — " + markdownText(a, 0)
 	}
 	return line
 }

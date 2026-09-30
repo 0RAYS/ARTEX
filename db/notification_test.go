@@ -366,7 +366,7 @@ func TestDigestBatchDueAndStableBatchID(t *testing.T) {
 		t.Fatal("超过周期的批次应判定为到期")
 	}
 
-	batch, err := d.ClaimDigestBatch(ctx, ch.ID, time.Minute)
+	batch, err := d.ClaimDigestBatch(ctx, ch.ID, MaxDigestBatchSize, time.Minute)
 	if err != nil {
 		t.Fatalf("领取汇总批次失败: %v", err)
 	}
@@ -400,7 +400,7 @@ func TestDigestBatchDueAndStableBatchID(t *testing.T) {
 	if _, err := d.Exec(`UPDATE notification_deliveries SET next_attempt_at = now() - interval '1 minute' WHERE channel_id=$1`, ch.ID); err != nil {
 		t.Fatal(err)
 	}
-	reclaimed, err := d.ClaimDigestBatch(ctx, ch.ID, time.Minute)
+	reclaimed, err := d.ClaimDigestBatch(ctx, ch.ID, MaxDigestBatchSize, time.Minute)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -695,16 +695,24 @@ func TestNotificationChannelCRUDRoundTrip(t *testing.T) {
 	}
 }
 
-// TestSaveNotificationChannelDefaultsRate 覆盖「未指定限流时套用渠道默认值」。
-// 漏掉这一步会让新渠道默认不限流，直接把平台打到限流。
-func TestSaveNotificationChannelDefaultsRate(t *testing.T) {
+// TestSaveNotificationChannelKeepsExplicitZeroRate 锁住一个曾经写错的地方：
+// **0 是合法配置，含义是「不限流」，不能被 db 层当成「未指定」覆盖成默认值**。
+//
+// 历史 bug：SaveNotificationChannel 里写了 `if RatePerMin <= 0 { 取默认值 }`，
+// 于是文档、UI 提示、takeTokens 都按「0=不限流」解释，唯独写库这一层悄悄改成
+// 20（钉钉/企微/Telegram）或 100（飞书）——操作者以为放开了限流、实际被卡着，
+// 而且没有任何提示。「未指定」与「显式 0」的区别只有请求体能表达，
+// 所以默认值在 server 层填（见 notifyCreateChannel），db 层只管存。
+func TestSaveNotificationChannelKeepsExplicitZeroRate(t *testing.T) {
 	d := notifyTestDB(t)
 	ctx := context.Background()
-	ch := &NotificationChannel{
-		Name: "默认限流", Kind: notify.KindDingTalk,
+
+	// 显式 0（不限流）：必须原样存下来。
+	unlimited := &NotificationChannel{
+		Name: "不限流", Kind: notify.KindDingTalk, RatePerMin: 0,
 		Config: json.RawMessage(`{"webhook":"https://example.com/h"}`),
 	}
-	id, err := d.SaveNotificationChannel(ctx, ch)
+	id, err := d.SaveNotificationChannel(ctx, unlimited)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -713,11 +721,20 @@ func TestSaveNotificationChannelDefaultsRate(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.RatePerMin != 20 {
-		t.Fatalf("钉钉默认限流应为 20，得到 %d", got.RatePerMin)
+	if got.RatePerMin != 0 {
+		t.Fatalf("显式 0 表示不限流，必须原样保存，得到 %d", got.RatePerMin)
 	}
 	if got.Mode != NotifyModeRealtime {
 		t.Fatalf("默认模式应为 realtime，得到 %s", got.Mode)
+	}
+
+	// 负值是非法输入，应被拒绝而不是悄悄改成别的值。
+	bad := &NotificationChannel{
+		Name: "负限流", Kind: notify.KindDingTalk, RatePerMin: -1,
+		Config: json.RawMessage(`{"webhook":"https://example.com/h"}`),
+	}
+	if _, err := d.SaveNotificationChannel(ctx, bad); err == nil {
+		t.Fatal("负限流应被拒绝")
 	}
 }
 
@@ -754,5 +771,32 @@ func TestDeleteChannelCascadesDeliveries(t *testing.T) {
 	}
 	if !evExists {
 		t.Fatal("删渠道不应连带删除事件本身")
+	}
+}
+
+// TestClaimDigestBatchHonorsCallerLimit 覆盖审计指出的一处口子：
+// 汇总渠道此前完全绕过令牌桶——allow 被 takeTokens 扣掉却没人用，
+// rate_per_min 对 digest 模式毫无作用。现在 limit 也参与约束。
+func TestClaimDigestBatchHonorsCallerLimit(t *testing.T) {
+	d := notifyTestDB(t)
+	ctx := context.Background()
+	ch := newTestChannel(t, d, notify.KindDingTalk, NotifyModeDigest, `{}`)
+	for i := 0; i < 10; i++ {
+		addTestEvent(t, d, notify.EventFindingCreated, int64(7000+i), notify.Snapshot{Severity: "high"})
+	}
+	if _, _, err := d.FanOutPendingEvents(ctx, 100); err != nil {
+		t.Fatal(err)
+	}
+	// 取 limit=3：只能领到 3 条，其余留在库里。
+	got, err := d.ClaimDigestBatch(ctx, ch.ID, 3, time.Minute)
+	if err != nil {
+		t.Fatalf("领取失败: %v", err)
+	}
+	if len(got) != 3 {
+		t.Fatalf("应按调用方限流额度只领 3 条，得到 %d", len(got))
+	}
+	// limit=0 表示本轮额度用尽：一条都不该领，也不该报错。
+	if got, err := d.ClaimDigestBatch(ctx, ch.ID, 0, time.Minute); err != nil || len(got) != 0 {
+		t.Fatalf("额度为 0 时应领 0 条且不报错，得到 %d 条 err=%v", len(got), err)
 	}
 }

@@ -129,3 +129,22 @@ func TestSeverityAndStatusLabels(t *testing.T) {
 		t.Fatalf("未知状态应原样回显，得到 %q", got)
 	}
 }
+
+// TestTruncateHTMLNeverCutsEntity 覆盖审计指出的一处遗漏：截断不只要避开
+// 半截标签，还要避开被切断的 HTML 实体。
+//
+// `&amp;` 被切成 `&amp` 之后，一个只认实体的解析器可能拒收**整条**消息——
+// 而超长汇总消息本来就常见，代价太大。
+func TestTruncateHTMLNeverCutsEntity(t *testing.T) {
+	s := "aaaa&amp;bbbb&lt;cccc&quot;dddd"
+	for max := 1; max <= utf8.RuneCountInString(s)+2; max++ {
+		got := TruncateHTML(s, max)
+		// 尾部不得出现「有 & 但没有对应 ;」的实体残片。
+		if amp := strings.LastIndex(got, "&"); amp >= 0 && !strings.Contains(got[amp:], ";") {
+			t.Fatalf("max=%d: 尾部留下实体残片 %q", max, got[amp:])
+		}
+		if strings.Contains(got, "&amp\x00") {
+			t.Fatalf("max=%d: 出现畸形实体", max)
+		}
+	}
+}

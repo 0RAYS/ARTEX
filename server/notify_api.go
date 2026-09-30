@@ -217,11 +217,18 @@ func (s *Server) notifyCreateChannel(w http.ResponseWriter, r *http.Request) {
 		ch.Mode = *req.Mode
 	}
 	if req.RatePerMin != nil {
+		// 显式给值就照用——包括 0，它表示「不限流」，是合法配置。
 		if *req.RatePerMin < 0 {
 			writeErr(w, 400, "限流值不能为负")
 			return
 		}
 		ch.RatePerMin = *req.RatePerMin
+	}
+	// 只有「字段缺省」才套用渠道默认值。默认值必须在这里决定而不是在 db 层：
+	// 只有请求体能区分「没传这个字段」与「显式传了 0」，而两者的含义完全不同
+	// （前者=用默认，后者=不限流）。db 层把 0 也当未指定，会让不限流配置不可达。
+	if req.RatePerMin == nil {
+		ch.RatePerMin = channel.DefaultRatePerMin()
 	}
 	if req.Filter != nil {
 		// 写入时校验取值受限的过滤字段（如 min_severity）。详见 notify.Filter.Validate：
@@ -285,7 +292,13 @@ func (s *Server) notifyUpdateChannel(w http.ResponseWriter, r *http.Request) {
 	if stored == nil {
 		stored = map[string]any{}
 	}
-	merged := notify.MergeConfig(stored, req.Config)
+	// 用 PrepareConfigUpdate 而不是裸的 MergeConfig：目标地址变更时必须让操作者
+	// 对凭据字段重新表态，否则「只改地址、凭据沿用」会把库里的真凭据发到新地址。
+	merged, err := notify.PrepareConfigUpdate(kind, stored, req.Config)
+	if err != nil {
+		writeErr(w, 400, err.Error())
+		return
+	}
 	if err := channel.Validate(merged); err != nil {
 		writeErr(w, 400, err.Error())
 		return
@@ -413,7 +426,9 @@ func (s *Server) notifyTestChannel(w http.ResponseWriter, r *http.Request) {
 	}
 	msg := notifyTestMessage(s.notifierBaseURL(pg))
 	start := time.Now()
-	if err := channel.Send(r.Context(), cfg, msg); err != nil {
+	// 测试消息只有一条，送达条数这里不需要（渠道长度上限对单条消息而言
+	// 由截断兜底，不涉及分段）。
+	if _, err := channel.Send(r.Context(), cfg, msg); err != nil {
 		// 把渠道返回的原始错误如实回给用户——这是他们调试配置的唯一线索。
 		writeErr(w, 502, err.Error())
 		return

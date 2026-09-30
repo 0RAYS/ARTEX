@@ -16,9 +16,16 @@ type Channel interface {
 	// Validate 在保存配置时调用，校验必填字段与格式。返回的错误会直接展示给
 	// 配置者，所以文案要说明「缺哪个字段」而不是泛泛的「配置无效」。
 	Validate(cfg map[string]any) error
-	// Send 投递一次消息。返回 nil 表示平台已确认接收；返回错误表示失败，
-	// 其中 *PermanentError 表示不该重试（投递引擎据此跳过退避）。
-	Send(ctx context.Context, cfg map[string]any, m Message) error
+	// Send 投递一次消息，返回**实际送达的条目数**与错误。
+	//
+	// 为什么要返回条数：各平台都有消息长度上限，汇总消息装不下整批时会被截断。
+	// 若调用方无条件把整批标记为已送达，被截掉的那些条目就消失了——消息里看不到、
+	// 投递历史里也显示成功，没有任何地方能发现漏洞从未发出。返回 kept 后，
+	// 调用方只标记前 kept 条，其余留待下一批。
+	//
+	// 返回错误表示投递失败，其中 *PermanentError 表示不该重试。
+	// 失败时 kept 无意义，调用方应忽略它。
+	Send(ctx context.Context, cfg map[string]any, m Message) (int, error)
 	// DefaultRatePerMin 返回该渠道官方建议的每分钟投递上限，作为新建渠道实例
 	// 时的默认限流值。返回 0 表示无已知限制。
 	DefaultRatePerMin() int
@@ -27,6 +34,13 @@ type Channel interface {
 	// （企业微信的整个 Webhook 地址就是凭据，而钉钉的只是其中的 secret），
 	// 所以这个知识必须由渠道提供，不能由上层猜测。
 	SecretKeys() []string
+	// DestinationKeys 返回该渠道配置里决定「消息发往哪里」的键名。
+	//
+	// 与 SecretKeys 一样是安全相关的东西：目标地址与凭据是两套独立字段，
+	// 若允许「只改地址、凭据原样保留」，任何能改渠道配置的人都能把库里的真凭据
+	// 发到自己控制的服务器，渠道配置的掩码就完全失去意义。
+	// 详见 PrepareConfigUpdate。
+	DestinationKeys() []string
 }
 
 // registry 是渠道注册表。刻意用显式字面量而不是 init() 自注册：这样「有哪些渠道」

@@ -75,7 +75,7 @@ func TestChannelErrorsNeverLeakCredentials(t *testing.T) {
 	for _, tc := range credentialCases {
 		t.Run(tc.name, func(t *testing.T) {
 			// 必然失败的对端：127.0.0.1:1 无人监听，走的是连接被拒这条路径。
-			err := tc.ch.Send(context.Background(), tc.cfg, Message{
+			_, err := tc.ch.Send(context.Background(), tc.cfg, Message{
 				Items: []Item{{FindingID: 1, Severity: "high", Name: "泄露探针"}},
 			})
 			if err == nil {
@@ -103,7 +103,7 @@ func TestChannelErrorsNeverLeakCredentialsInPermanentPath(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			err := tc.ch.Send(context.Background(), tc.cfg, Message{Items: []Item{{Severity: "high"}}})
+			_, err := tc.ch.Send(context.Background(), tc.cfg, Message{Items: []Item{{Severity: "high"}}})
 			if err == nil {
 				t.Fatal("非法配置应报错")
 			}
@@ -203,7 +203,7 @@ func TestCrossHostRedirectRefused(t *testing.T) {
 	}))
 	defer redirector.Close()
 
-	err := (dingTalkChannel{}).Send(context.Background(),
+	_, err := (dingTalkChannel{}).Send(context.Background(),
 		map[string]any{"webhook": redirector.URL + "/robot/send?access_token=" + leakProbeToken},
 		Message{Items: []Item{{Severity: "high"}}})
 	if err == nil {
@@ -228,7 +228,7 @@ func TestSameHostRedirectAllowed(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	if err := (dingTalkChannel{}).Send(context.Background(),
+	if _, err := (dingTalkChannel{}).Send(context.Background(),
 		map[string]any{"webhook": srv.URL + "/robot/send"},
 		Message{Items: []Item{{Severity: "high"}}}); err != nil {
 		t.Fatalf("同主机重定向不应被拒绝: %v", err)

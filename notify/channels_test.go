@@ -77,7 +77,7 @@ func TestDingTalkSendsActionCardWhenLinkPresent(t *testing.T) {
 			t.Errorf("回链丢失: %v", card["singleURL"])
 		}
 	})
-	if err := (dingTalkChannel{}).Send(context.Background(), map[string]any{"webhook": srv.URL}, singleMsg()); err != nil {
+	if _, err := (dingTalkChannel{}).Send(context.Background(), map[string]any{"webhook": srv.URL}, singleMsg()); err != nil {
 		t.Fatalf("投递失败: %v", err)
 	}
 }
@@ -92,7 +92,7 @@ func TestDingTalkFallsBackToMarkdownForBatch(t *testing.T) {
 			t.Errorf("汇总正文缺少时间窗: %v", md["text"])
 		}
 	})
-	if err := (dingTalkChannel{}).Send(context.Background(), map[string]any{"webhook": srv.URL}, batchMsg(3)); err != nil {
+	if _, err := (dingTalkChannel{}).Send(context.Background(), map[string]any{"webhook": srv.URL}, batchMsg(3)); err != nil {
 		t.Fatalf("投递失败: %v", err)
 	}
 }
@@ -101,7 +101,7 @@ func TestDingTalkFallsBackToMarkdownForBatch(t *testing.T) {
 // 不检查 errcode 会把投递失败记成成功——这是各家国内 IM 平台共有的坑。
 func TestDingTalkBusinessErrorIsPermanent(t *testing.T) {
 	srv := capturePost(t, `{"errcode":310000,"errmsg":"keywords not in content"}`, nil)
-	err := (dingTalkChannel{}).Send(context.Background(), map[string]any{"webhook": srv.URL}, singleMsg())
+	_, err := (dingTalkChannel{}).Send(context.Background(), map[string]any{"webhook": srv.URL}, singleMsg())
 	if err == nil {
 		t.Fatal("errcode 非 0 应报错")
 	}
@@ -125,7 +125,7 @@ func TestWeComTruncatesCJKWithinByteLimit(t *testing.T) {
 	})
 	// 造一批足够长的中文汇总，必然超过 4096 字节。
 	m := batchMsg(200)
-	if err := (weComChannel{}).Send(context.Background(), map[string]any{"webhook": srv.URL}, m); err != nil {
+	if _, err := (weComChannel{}).Send(context.Background(), map[string]any{"webhook": srv.URL}, m); err != nil {
 		t.Fatalf("投递失败: %v", err)
 	}
 	if contentLen > weComMarkdownLimit {
@@ -138,13 +138,13 @@ func TestWeComTruncatesCJKWithinByteLimit(t *testing.T) {
 
 func TestWeComRateLimitIsRetryableButKeyErrorIsPermanent(t *testing.T) {
 	limited := capturePost(t, `{"errcode":45009,"errmsg":"api freq out of limit"}`, nil)
-	err := (weComChannel{}).Send(context.Background(), map[string]any{"webhook": limited.URL}, singleMsg())
+	_, err := (weComChannel{}).Send(context.Background(), map[string]any{"webhook": limited.URL}, singleMsg())
 	if err == nil || IsPermanent(err) {
 		t.Fatalf("45009 是滚动窗口限流，应可重试，得到 %v", err)
 	}
 
 	badKey := capturePost(t, `{"errcode":93000,"errmsg":"invalid webhook url"}`, nil)
-	err = (weComChannel{}).Send(context.Background(), map[string]any{"webhook": badKey.URL}, singleMsg())
+	_, err = (weComChannel{}).Send(context.Background(), map[string]any{"webhook": badKey.URL}, singleMsg())
 	if err == nil || !IsPermanent(err) {
 		t.Fatalf("93000 是 key 无效，重试不会自愈，应为永久失败，得到 %v", err)
 	}
@@ -186,7 +186,7 @@ func TestFeishuCardStructureAndSign(t *testing.T) {
 		}
 	})
 	cfg := map[string]any{"webhook": srv.URL, "secret": secret}
-	if err := (feishuChannel{}).Send(context.Background(), cfg, singleMsg()); err != nil {
+	if _, err := (feishuChannel{}).Send(context.Background(), cfg, singleMsg()); err != nil {
 		t.Fatalf("投递失败: %v", err)
 	}
 }
@@ -197,7 +197,7 @@ func TestFeishuWithoutSecretOmitsSign(t *testing.T) {
 			t.Fatalf("未配置 secret 时不应带加签参数: %v", body)
 		}
 	})
-	if err := (feishuChannel{}).Send(context.Background(), map[string]any{"webhook": srv.URL}, singleMsg()); err != nil {
+	if _, err := (feishuChannel{}).Send(context.Background(), map[string]any{"webhook": srv.URL}, singleMsg()); err != nil {
 		t.Fatalf("投递失败: %v", err)
 	}
 }
@@ -216,7 +216,7 @@ func TestTelegramEscapesHTMLInUntrustedContent(t *testing.T) {
 		Name:    `<script>alert(1)</script>`,
 		Summary: "a & b < c",
 	}}}
-	if err := (telegramChannel{}).Send(context.Background(),
+	if _, err := (telegramChannel{}).Send(context.Background(),
 		map[string]any{"bot_token": "tok", "chat_id": "1", "base_url": srv.URL}, m); err != nil {
 		t.Fatalf("投递失败: %v", err)
 	}
@@ -233,14 +233,14 @@ func TestTelegramEscapesHTMLInUntrustedContent(t *testing.T) {
 
 func TestTelegramErrorClassification(t *testing.T) {
 	rateLimited := capturePost(t, `{"ok":false,"error_code":429,"description":"Too Many Requests"}`, nil)
-	err := (telegramChannel{}).Send(context.Background(),
+	_, err := (telegramChannel{}).Send(context.Background(),
 		map[string]any{"bot_token": "tok", "chat_id": "1", "base_url": rateLimited.URL}, singleMsg())
 	if err == nil || IsPermanent(err) {
 		t.Fatalf("429 应可重试，得到 %v", err)
 	}
 
 	forbidden := capturePost(t, `{"ok":false,"error_code":403,"description":"bot was blocked by the user"}`, nil)
-	err = (telegramChannel{}).Send(context.Background(),
+	_, err = (telegramChannel{}).Send(context.Background(),
 		map[string]any{"bot_token": "tok", "chat_id": "1", "base_url": forbidden.URL}, singleMsg())
 	if err == nil || !IsPermanent(err) {
 		t.Fatalf("403 是配置问题，应为永久失败，得到 %v", err)
@@ -267,7 +267,7 @@ func TestWebhookDefaultTemplateProducesValidJSON(t *testing.T) {
 			t.Errorf("finding_id 应为数字，得到 %T", it["finding_id"])
 		}
 	})
-	if err := (webhookChannel{}).Send(context.Background(), map[string]any{"url": srv.URL}, singleMsg()); err != nil {
+	if _, err := (webhookChannel{}).Send(context.Background(), map[string]any{"url": srv.URL}, singleMsg()); err != nil {
 		t.Fatalf("投递失败: %v", err)
 	}
 }
@@ -289,14 +289,14 @@ func TestWebhookCustomTemplateAndHeaders(t *testing.T) {
 		"headers":       map[string]any{"X-Token": "s3cret"},
 		"body_template": `{"msg": {{json (printf "%d 条" .Count)}}, "first": {{json (index .Items 0).Name}}}`,
 	}
-	if err := (webhookChannel{}).Send(context.Background(), cfg, batchMsg(3)); err != nil {
+	if _, err := (webhookChannel{}).Send(context.Background(), cfg, batchMsg(3)); err != nil {
 		t.Fatalf("投递失败: %v", err)
 	}
 }
 
 func TestWebhookRejectsNonJSONRenderResult(t *testing.T) {
 	cfg := map[string]any{"url": "https://example.com/hook", "body_template": `not json at all`}
-	err := (webhookChannel{}).Send(context.Background(), cfg, singleMsg())
+	_, err := (webhookChannel{}).Send(context.Background(), cfg, singleMsg())
 	if err == nil || !IsPermanent(err) {
 		t.Fatalf("渲染结果非 JSON 应为永久失败（模板写错了，重试无用），得到 %v", err)
 	}

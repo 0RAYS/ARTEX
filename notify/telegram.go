@@ -29,6 +29,9 @@ func (telegramChannel) DefaultRatePerMin() int { return 20 }
 // Bot Token 是完整凭据；chat_id 只是收件人，不算秘密（拿到它没有 Token 也发不了消息）。
 func (telegramChannel) SecretKeys() []string { return []string{"bot_token"} }
 
+// base_url 决定 Token 被发往哪个 API 端点（如自建反代），改它必须重新表态 Token。
+func (telegramChannel) DestinationKeys() []string { return []string{"base_url"} }
+
 func (telegramChannel) Validate(cfg map[string]any) error {
 	if cfgString(cfg, "bot_token") == "" {
 		return errors.New("缺少 Bot Token")
@@ -44,23 +47,24 @@ func (telegramChannel) Validate(cfg map[string]any) error {
 	return nil
 }
 
-func (c telegramChannel) Send(ctx context.Context, cfg map[string]any, m Message) error {
+func (c telegramChannel) Send(ctx context.Context, cfg map[string]any, m Message) (int, error) {
 	if err := c.Validate(cfg); err != nil {
-		return Permanent(err)
+		return 0, Permanent(err)
 	}
 	endpoint, err := telegramEndpoint(cfg)
 	if err != nil {
-		return Permanent(err)
+		return 0, Permanent(err)
 	}
+	text, kept := telegramHTML(m)
 	payload := map[string]any{
 		"chat_id":                  cfgString(cfg, "chat_id"),
-		"text":                     telegramHTML(m),
+		"text":                     text,
 		"parse_mode":               "HTML",
 		"disable_web_page_preview": false,
 	}
 	raw, err := doJSON(ctx, "POST", endpoint, nil, payload)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	var res struct {
 		OK          bool   `json:"ok"`
@@ -68,17 +72,17 @@ func (c telegramChannel) Send(ctx context.Context, cfg map[string]any, m Message
 		Description string `json:"description"`
 	}
 	if err := json.Unmarshal(raw, &res); err != nil {
-		return fmt.Errorf("解析 Telegram 响应失败: %w (%s)", err, snippet(raw))
+		return 0, fmt.Errorf("解析 Telegram 响应失败: %w (%s)", err, snippet(raw))
 	}
 	if res.OK {
-		return nil
+		return kept, nil
 	}
 	// 429 是限流，退避后重试有效；其余（400 参数错、401 token 错、403 被拉黑、
 	// 404 chat 不存在）都是配置问题，重试不会自愈。
 	if res.ErrorCode == 429 {
-		return fmt.Errorf("Telegram 限流: %s", res.Description)
+		return 0, fmt.Errorf("Telegram 限流: %s", res.Description)
 	}
-	return Permanent(fmt.Errorf("Telegram 返回错误 %d: %s", res.ErrorCode, res.Description))
+	return 0, Permanent(fmt.Errorf("Telegram 返回错误 %d: %s", res.ErrorCode, res.Description))
 }
 
 // telegramEndpoint 拼出 sendMessage 地址。base_url 留空时用官方 API，
@@ -99,27 +103,30 @@ func telegramEndpoint(cfg map[string]any) (string, error) {
 	return u.String(), nil
 }
 
-// telegramHTML 渲染 HTML 正文。
-func telegramHTML(m Message) string {
+// telegramHTML 渲染 HTML 正文，返回正文与实际写入的条目数（见 Channel.Send）。
+func telegramHTML(m Message) (string, int) {
 	var b strings.Builder
 	b.WriteString("<b>" + telegramEscape(markdownTitle(m)) + "</b>\n")
 	if m.Batch {
-		for i, it := range m.Items {
-			var line string
-			if a := assetLine(it.Assets, maxAssetsShown); a != "" {
-				line = fmt.Sprintf("%d. %s · %s — %s", i+1, SeverityLabel(it.Severity), it.Title(), a)
-			} else {
-				line = fmt.Sprintf("%d. %s · %s", i+1, SeverityLabel(it.Severity), it.Title())
-			}
-			b.WriteString("\n" + telegramEscape(line))
-		}
+		// Telegram 的上限是**字符数**，所以打包也按字符计量（runeSize）。
+		footer := ""
 		if m.HomeURL != "" {
-			b.WriteString(fmt.Sprintf("\n\n<a href=\"%s\">在平台中查看全部</a>", telegramEscapeAttr(m.HomeURL)))
+			footer = fmt.Sprintf("\n\n<a href=\"%s\">在平台中查看全部</a>", telegramEscapeAttr(m.HomeURL))
 		}
-		return TruncateHTML(b.String(), telegramTextLimit)
+		kept := packItemCount(m.Items, telegramTextLimit, telegramReservedRunes, footer, runeSize, func(it Item, idx int) string {
+			return telegramBatchLine(it, idx+1)
+		})
+		items := m.Items[:kept]
+		b.Reset()
+		b.WriteString("<b>" + telegramEscape(telegramBatchTitle(m, items, len(m.Items))) + "</b>")
+		for i, it := range items {
+			b.WriteString("\n" + telegramEscape(telegramBatchLine(it, i+1)))
+		}
+		b.WriteString(footer)
+		return TruncateHTML(b.String(), telegramTextLimit), kept
 	}
 	if len(m.Items) == 0 {
-		return b.String()
+		return b.String(), 0
 	}
 	it := m.Items[0]
 	if it.IsStatusChange() {
@@ -138,7 +145,31 @@ func telegramHTML(m Message) string {
 	if it.DetailURL != "" {
 		b.WriteString(fmt.Sprintf("\n\n<a href=\"%s\">查看详情</a>", telegramEscapeAttr(it.DetailURL)))
 	}
-	return TruncateHTML(b.String(), telegramTextLimit)
+	return TruncateHTML(b.String(), telegramTextLimit), 1
+}
+
+// telegramReservedRunes 预留给消息标题与可能出现的截断提示（按字符计）。
+const telegramReservedRunes = 160
+
+// telegramBatchLine 渲染汇总里的一条（未转义，由调用方统一转义）。
+func telegramBatchLine(it Item, idx int) string {
+	if a := assetLine(it.Assets, maxAssetsShown); a != "" {
+		return fmt.Sprintf("%d. %s · %s — %s", idx, SeverityLabel(it.Severity), it.Title(), a)
+	}
+	return fmt.Sprintf("%d. %s · %s", idx, SeverityLabel(it.Severity), it.Title())
+}
+
+// telegramBatchTitle 渲染汇总消息的标题行。条数用的是**本条实际包含**的条数，
+// 而不是本批总数——否则读者会以为消息头写的数字就是全部。
+func telegramBatchTitle(m Message, items []Item, total int) string {
+	title := fmt.Sprintf("漏洞汇总 · 共 %d 条", total)
+	if extra := total - len(items); extra > 0 {
+		title += fmt.Sprintf("（显示前 %d 条，其余 %d 条下一条继续）", len(items), extra)
+	}
+	if m.WindowMinutes > 0 {
+		title = fmt.Sprintf("近 %d 分钟 · %s", m.WindowMinutes, title)
+	}
+	return title
 }
 
 // telegramEscape 转义 HTML 文本内容。

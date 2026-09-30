@@ -167,7 +167,16 @@ func (d *DB) DigestBatchDue(ctx context.Context, channelID int64, minAge time.Du
 //
 // 按 id 升序取前 N 条而非随机取：最早产生的投递最先发出去，积压时不会出现
 // 「新漏洞先发、老漏洞永远排在后面」的饥饿。
-func (d *DB) ClaimDigestBatch(ctx context.Context, channelID int64, lease time.Duration) ([]*NotificationDelivery, error) {
+func (d *DB) ClaimDigestBatch(ctx context.Context, channelID int64, limit int, lease time.Duration) ([]*NotificationDelivery, error) {
+	if limit <= 0 {
+		return nil, nil
+	}
+	// 单批同时受两个上界约束：调用方的限流额度（本轮还能发几条）与内存上界
+	// MaxDigestBatchSize。此前只用了后者，于是 digest 渠道的 rate_per_min
+	// 完全不生效——令牌被 takeTokens 扣掉却没人用，等于白扣。
+	if limit > MaxDigestBatchSize {
+		limit = MaxDigestBatchSize
+	}
 	out, err := d.claimDeliveries(ctx, lease, claimQuery{
 		sql: `SELECT dd.id FROM notification_deliveries dd
 JOIN notification_channels c ON c.id = dd.channel_id
@@ -175,7 +184,7 @@ WHERE dd.channel_id = $1 AND dd.state IN ($2,$3) AND dd.next_attempt_at <= now()
 ORDER BY dd.id
 FOR UPDATE OF dd SKIP LOCKED
 LIMIT $4`,
-		args: []any{channelID, NotifyStatePending, NotifyStateSending, MaxDigestBatchSize},
+		args: []any{channelID, NotifyStatePending, NotifyStateSending, limit},
 	}, func(tx *sql.Tx, ids []int64) error {
 		batchID := ids[0]
 		for _, id := range ids {
@@ -287,6 +296,27 @@ func (d *DB) RescheduleDeliveries(ctx context.Context, ids []int64, delay time.D
 SET state=$1, next_attempt_at=now()+make_interval(secs => $2), last_error=$3
 WHERE id IN (`+ph+`)`,
 		append([]any{NotifyStatePending, delay.Seconds(), truncateNotifyError(errMsg)}, args...)...)
+	return err
+}
+
+// DeferDeliveries 把一批投递退回 pending、立即可再领，并**撤销领取时计的那一次尝试**。
+//
+// 用途只有一个：汇总消息按渠道长度上限分段发送时，没装进本条的条目要留到下一批。
+// 那不是失败，所以不该消耗重试预算——领取时 attempts 已经乐观地 +1 了，
+// 这里必须减回去。否则一个 500 条的积压会按每段 20 条切成 25 段，
+// 尾部条目在第 3 段就被 MaxNotifyAttempts 判成 failed，而它们从未出过任何错。
+//
+// GREATEST(...,0) 兜住「有人手工重发把 attempts 清零后又走到这里」的情况，
+// 不让计数变成负数。
+func (d *DB) DeferDeliveries(ctx context.Context, ids []int64, reason string) error {
+	ph, args := placeholders(3, ids)
+	if len(args) == 0 {
+		return nil
+	}
+	_, err := d.ExecContext(ctx, `UPDATE notification_deliveries
+SET state=$1, attempts=GREATEST(attempts-1, 0), next_attempt_at=now(), last_error=$2
+WHERE id IN (`+ph+`)`,
+		append([]any{NotifyStatePending, truncateNotifyError(reason)}, args...)...)
 	return err
 }
 

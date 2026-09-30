@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"net/url"
 	"strconv"
 	"time"
@@ -31,6 +32,9 @@ func (dingTalkChannel) DefaultRatePerMin() int { return 20 }
 // 钉钉的 Webhook 地址里带 access_token，本身就是凭据，因此整体掩码。
 func (dingTalkChannel) SecretKeys() []string { return []string{"webhook", "secret"} }
 
+// 目标是钉钉的 Webhook 地址本身；改地址必须同时对新地址重新表态加签密钥。
+func (dingTalkChannel) DestinationKeys() []string { return []string{"webhook"} }
+
 func (dingTalkChannel) Validate(cfg map[string]any) error {
 	hook := cfgString(cfg, "webhook")
 	if hook == "" {
@@ -43,19 +47,19 @@ func (dingTalkChannel) Validate(cfg map[string]any) error {
 }
 
 // Send 投递一次消息。有回链且是单条时用 ActionCard（带按钮），否则用 markdown。
-func (c dingTalkChannel) Send(ctx context.Context, cfg map[string]any, m Message) error {
+func (c dingTalkChannel) Send(ctx context.Context, cfg map[string]any, m Message) (int, error) {
 	hook := cfgString(cfg, "webhook")
 	if err := c.Validate(cfg); err != nil {
-		return Permanent(err)
+		return 0, Permanent(err)
 	}
 	endpoint, err := dingTalkSignedURL(hook, cfgString(cfg, "secret"), time.Now())
 	if err != nil {
-		return Permanent(err)
+		return 0, Permanent(err)
 	}
 
 	title := markdownTitle(m)
 	// 钉钉 markdown 正文无明确字节上限，但仍做上限保护，避免证据字段异常膨胀。
-	text := markdownBody(m, 20000)
+	text, kept := markdownBody(m, 20000)
 
 	var payload any
 	if !m.Batch && len(m.Items) == 1 && m.Items[0].DetailURL != "" {
@@ -78,7 +82,7 @@ func (c dingTalkChannel) Send(ctx context.Context, cfg map[string]any, m Message
 
 	raw, err := doJSON(ctx, "POST", endpoint, nil, payload)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	// 钉钉把业务错误藏在 200 响应里。
 	var res struct {
@@ -86,14 +90,14 @@ func (c dingTalkChannel) Send(ctx context.Context, cfg map[string]any, m Message
 		ErrMsg  string `json:"errmsg"`
 	}
 	if err := json.Unmarshal(raw, &res); err != nil {
-		return fmt.Errorf("解析钉钉响应失败: %w (%s)", err, snippet(raw))
+		return 0, fmt.Errorf("解析钉钉响应失败: %w (%s)", err, snippet(raw))
 	}
 	if res.ErrCode != 0 {
 		// 301000 是签名校验失败、310000 是关键词不匹配——都是配置错误，
 		// 重试不会自愈。
-		return Permanent(fmt.Errorf("钉钉返回错误 %d: %s", res.ErrCode, res.ErrMsg))
+		return 0, Permanent(fmt.Errorf("钉钉返回错误 %d: %s", res.ErrCode, res.ErrMsg))
 	}
-	return nil
+	return kept, nil
 }
 
 // dingTalkSignedURL 按官方加签规则给 webhook 追加 timestamp 与 sign 参数。
@@ -122,19 +126,35 @@ func dingTalkSignedURL(hook, secret string, now time.Time) (string, error) {
 	return u.String(), nil
 }
 
-// validateHTTPURL 校验地址可用且协议受支持。
-// 限制协议是防御性的：file:// 之类会让 http.Client 产生意料之外的行为，
-// 虽然 webhook 地址由管理员配置、不是攻击者可控，但没有理由放开这个面。
+// validateHTTPURL 校验地址可用、协议受支持，并对字面 IP 目标做内网判断。
+//
+// 两点讲究：
+//
+//  1. **错误信息必须脱敏**。url.Parse 自己返回的是 *url.Error，它的 Error() 带
+//     **完整原始地址**，而本功能这几家的地址里就嵌着凭据（钉钉 access_token、
+//     企微 key、Telegram 的 bot token、飞书 hook id）。曾经这里直接 `return err`，
+//     于是「地址格式非法」这条错误就把凭据带了出去，流向测试接口的 400 响应、
+//     每次投递落库的 last_error、服务端日志与投递历史接口。
+//
+//  2. **字面 IP 直接判内网**，域名留给拨号阶段判（blockInternalDial 才是最终
+//     生效点，也能覆盖 DNS 重绑定）。这里做一次是为了让保存配置时就能得到提示，
+//     而不是等到第一次投递失败。
+//
+// 限制协议是防御性的：file:///gopher:// 之类会让 http.Client 产生意料之外的
+// 行为（虽已被 scheme 检查挡下，但没有理由放开这个面）。
 func validateHTTPURL(raw string) error {
 	u, err := url.Parse(raw)
 	if err != nil {
-		return err
+		return fmt.Errorf("地址无法解析（%s）", redactRequestTarget(raw))
 	}
 	if u.Scheme != "http" && u.Scheme != "https" {
 		return fmt.Errorf("只支持 http/https，收到 %q", u.Scheme)
 	}
 	if u.Host == "" {
 		return errors.New("缺少主机名")
+	}
+	if ip := net.ParseIP(u.Hostname()); ip != nil && isBlockedDialIP(ip) && !allowLocalTargets() {
+		return fmt.Errorf("拒绝投递到本机/链路本地地址 %s（如确需投递到本机服务，设置 %s=1）", ip, AllowLocalTargetsEnv)
 	}
 	return nil
 }
