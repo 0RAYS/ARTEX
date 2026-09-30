@@ -237,7 +237,16 @@ func (d *DB) FinishFindingRetest(id int64, status, reason string) error {
 		return err
 	}
 	if finalStatus == "completed" && verdict == "fixed" {
-		if _, err := tx.Exec(`UPDATE findings SET status=$1 WHERE id=$2`, FindingFixed, findingID); err != nil {
+		// 走带通知的版本，与人工在详情页改状态共用同一套语义。
+		//
+		// 此前这里是裸的 UPDATE：复测判「已修复」时状态确实变了，但配了
+		// on_status_change 的渠道完全收不到推送——状态在界面上悄悄变了，
+		// 运维要打开平台才知道。状态更新与推送事件必须一起落库，
+		// SetFindingStatusTx 内部处理了「状态没变就不登记」等细节。
+		// 用 context.Background()：本函数整条都是无 ctx 的旧风格（d.Begin()/
+		// tx.QueryRow/tx.Exec），没有可传递的取消信号，硬加一个 ctx 参数会
+		// 牵动 server 侧调用点与多处测试，超出本次改动的范围。
+		if _, _, _, _, err := SetFindingStatusTx(context.Background(), tx, findingID, FindingFixed); err != nil {
 			return err
 		}
 	}

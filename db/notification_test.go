@@ -800,3 +800,75 @@ func TestClaimDigestBatchHonorsCallerLimit(t *testing.T) {
 		t.Fatalf("额度为 0 时应领 0 条且不报错，得到 %d 条 err=%v", len(got), err)
 	}
 }
+
+// TestFinishFindingRetestEmitsStatusChange 覆盖审计指出的一处完整性缺口：
+// 复测结论为「已修复」时，状态确实变了，但那条 UPDATE 是直接写库的、
+// 绕过了带通知的版本——于是配了 on_status_change 的渠道对这种状态流转
+// 完全收不到推送，界面上状态悄悄变了，运维要打开平台才知道。
+//
+// 这条用例锁住「所有改状态的路径都要登记状态变更事件」。
+func TestFinishFindingRetestEmitsStatusChange(t *testing.T) {
+	d := notifyTestDB(t)
+	ctx := context.Background()
+
+	tk, err := d.CreateTask("复测推送测试", "目标", nil, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.DeleteTask(tk.ID)
+	es := d.Exploration(tk.ExplorationID)
+	f, err := es.RecordFinding(ctx, RecordFindingInput{
+		TaskID: tk.ID, Worker: "test", VulnClass: "SQL注入", Name: "复测目标",
+		Severity: "high", Summary: "摘要",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { d.Exec(`DELETE FROM notification_events WHERE finding_id=$1`, f.FindingID) })
+
+	// 建一条复测记录并直接推到完成态。
+	rt, _, _, err := d.CreateFindingRetest(ctx, f.FindingID, "复核")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rt.ConversationID == nil {
+		t.Fatal("复测应关联一个会话")
+	}
+	// 复测必须先进入 running 才能落结论（与真实流程一致）。
+	if ok, err := d.StartFindingRetest(ctx, rt.ID); err != nil || !ok {
+		t.Fatalf("启动复测失败: ok=%v err=%v", ok, err)
+	}
+	if err := d.RecordFindingRetestResult(ctx, *rt.ConversationID, "fixed", "已修复", "证据"); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.FinishFindingRetest(rt.ID, "completed", ""); err != nil {
+		t.Fatalf("结束复测失败: %v", err)
+	}
+
+	var status string
+	if err := d.QueryRow(`SELECT status FROM findings WHERE id=$1`, f.FindingID).Scan(&status); err != nil {
+		t.Fatal(err)
+	}
+	if status != FindingFixed {
+		t.Fatalf("复测判已修复后状态应为 fixed，得到 %s", status)
+	}
+
+	// 关键断言：必须有一条状态变更事件，且 from/to 正确。
+	var snapshot []byte
+	err = d.QueryRow(`SELECT snapshot FROM notification_events WHERE finding_id=$1 AND kind=$2 ORDER BY id DESC LIMIT 1`,
+		f.FindingID, notify.EventFindingStatusChanged).Scan(&snapshot)
+	if err != nil {
+		t.Fatalf("复测判已修复应登记状态变更推送事件（否则配了 on_status_change 的渠道收不到）: %v", err)
+	}
+	var snap notify.Snapshot
+	if err := json.Unmarshal(snapshot, &snap); err != nil {
+		t.Fatal(err)
+	}
+	if snap.FromStatus != "pending" || snap.ToStatus != FindingFixed {
+		t.Fatalf("快照的状态流转不对: %s → %s", snap.FromStatus, snap.ToStatus)
+	}
+	// 快照要带渲染所需字段，否则推送出来是空壳。
+	if snap.Name != "复测目标" || snap.Severity != "high" {
+		t.Fatalf("快照缺少渲染字段: %+v", snap)
+	}
+}

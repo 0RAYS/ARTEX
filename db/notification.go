@@ -463,44 +463,62 @@ func assetDisplayName(typ, domain, ip, url, appName, bundleID string) string {
 //     所以 notified=false 时状态已经改成功了，调用方不应因此报错。
 func (d *DB) SetFindingStatusWithNotify(ctx context.Context, id int64, status string) (from string, found bool, notified bool, err error) {
 	err = d.WithEvidenceTx(ctx, func(tx *sql.Tx) error {
-		var (
-			vulnclass, name, severity, summary string
-			taskID                             sql.NullInt64
-			assetIDs                           []byte
-		)
-		scanErr := tx.QueryRowContext(ctx, `SELECT vulnclass, name, severity, summary, task_id, asset_ids, status
-FROM findings WHERE id=$1 FOR UPDATE`, id).
-			Scan(&vulnclass, &name, &severity, &summary, &taskID, &assetIDs, &from)
-		if scanErr == sql.ErrNoRows {
-			return nil
-		}
-		if scanErr != nil {
-			return scanErr
-		}
-		found = true
-		if from == status {
-			return nil
-		}
-		if _, err := tx.ExecContext(ctx, `UPDATE findings SET status=$2 WHERE id=$1`, id, status); err != nil {
-			return err
-		}
-		var assets []int64
-		_ = json.Unmarshal(assetIDs, &assets)
-		notified = RecordNotificationEventTx(ctx, tx, notify.EventFindingStatusChanged, id, notify.Snapshot{
-			Kind:       notify.EventFindingStatusChanged,
-			FindingID:  id,
-			TaskID:     taskID.Int64,
-			VulnClass:  vulnclass,
-			Name:       name,
-			Severity:   severity,
-			Summary:    summary,
-			AssetIDs:   assets,
-			FromStatus: from,
-			ToStatus:   status,
-		})
-		return nil
+		var txErr error
+		from, found, _, notified, txErr = SetFindingStatusTx(ctx, tx, id, status)
+		return txErr
 	})
 	return from, found, notified, err
+}
+
+// SetFindingStatusTx 在**调用方的事务**内更新漏洞状态并登记状态变更推送事件。
+//
+// 抽成事务级函数是为了让所有改状态的路径共用同一套语义——此前只有
+// patchFinding 走带通知的版本，而**复测结论为「已修复」时**（finding_retests
+// 里那条 `UPDATE findings SET status=...`）是直接写库的，于是配了
+// `on_status_change` 的渠道对这类状态流转完全收不到推送：界面上状态悄悄变了，
+// 运维要到打开平台才发现。
+//
+// 返回 from=变更前状态、found=漏洞是否存在、changed=状态是否真的变了、
+// notified=事件是否登记成功（登记失败不影响状态更新，见 RecordNotificationEventTx）。
+func SetFindingStatusTx(ctx context.Context, tx *sql.Tx, id int64, status string) (from string, found bool, changed bool, notified bool, err error) {
+	var (
+		vulnclass, name, severity, summary string
+		taskID                             sql.NullInt64
+		assetIDs                           []byte
+	)
+	scanErr := tx.QueryRowContext(ctx, `SELECT vulnclass, name, severity, summary, task_id, asset_ids, status
+FROM findings WHERE id=$1 FOR UPDATE`, id).
+		Scan(&vulnclass, &name, &severity, &summary, &taskID, &assetIDs, &from)
+	if scanErr == sql.ErrNoRows {
+		return "", false, false, false, nil
+	}
+	if scanErr != nil {
+		return "", false, false, false, scanErr
+	}
+	found = true
+	if from == status {
+		// 状态没有真的变化就不登记事件：重复提交同一个值、幂等重放都不该
+		// 产生推送噪音。
+		return from, true, false, false, nil
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE findings SET status=$2 WHERE id=$1`, id, status); err != nil {
+		return from, true, false, false, err
+	}
+	var assets []int64
+	_ = json.Unmarshal(assetIDs, &assets)
+	notified = RecordNotificationEventTx(ctx, tx, notify.EventFindingStatusChanged, id, notify.Snapshot{
+		Kind:       notify.EventFindingStatusChanged,
+		FindingID:  id,
+		TaskID:     taskID.Int64,
+		VulnClass:  vulnclass,
+		Name:       name,
+		Severity:   severity,
+		Summary:    summary,
+		AssetIDs:   assets,
+		FromStatus: from,
+		ToStatus:   status,
+	})
+	return from, true, true, notified, nil
 }
 
 // NotificationStats 是通知页顶部的概览计数。
