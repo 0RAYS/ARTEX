@@ -943,6 +943,83 @@ export interface Settings {
   // worker/主 agent/对话)由 noa 接管上下文压缩,取代内置 compaction;每 run 读一次,对
   // 之后启动的 run 生效。
   noa_compaction?: boolean;
+  // ---- 漏洞 IM 推送（渠道本身是独立资源，见 /api/notify/*，这里只有三项全局配置）----
+  notify_enabled?: boolean; // 推送总开关，默认开；用于维护期一键止血
+  notify_public_base_url?: string; // 漏洞详情回链的外部访问地址；空=消息不带回链
+  notify_digest_interval_min?: number; // 汇总模式周期（分钟），默认 30
+}
+
+// ---- 漏洞 IM 推送 ----
+
+// NotificationFilter 是渠道的过滤条件，字段全部可选，缺省即不过滤。
+// 后端对所有字段都不加校验：配置畸形时按「命中」处理（宁可多推不可漏推）。
+export interface NotificationFilter {
+  min_severity?: string; // "" | low | medium | high | critical
+  task_ids?: number[]; // 空=不限；非空则要求与漏洞所属任务有交集
+  asset_ids?: number[]; // 空=不限；非空则要求与漏洞锚定资产有交集
+  vulnclass_include?: string[]; // 空=全收；非空则要求漏洞类型命中任一关键词（大小写不敏感子串）
+  vulnclass_exclude?: string[]; // 命中任一关键词即排除（排除优先于包含）
+  on_status_change?: boolean; // 是否也接收漏洞处置状态变更事件
+}
+
+// NotificationChannel 是一个渠道实例。config 的字段随 kind 而异，
+// 且凭据字段在读取时被替换成 "__masked__" 开头的掩码值——原样回传即表示「不改」。
+export interface NotificationChannel {
+  id: number;
+  name: string;
+  kind: string;
+  enabled: boolean;
+  mode: "realtime" | "digest";
+  config: Record<string, unknown>;
+  filter: NotificationFilter;
+  rate_per_min: number;
+  created_at: string;
+  updated_at: string;
+  // secret_keys 由后端按渠道类型给出，前端据此渲染密码框与「留空即不改」提示，
+  // 不硬编码任何渠道知识。
+  secret_keys: string[];
+}
+
+// NotificationKind 是 /api/notify/meta 返回的渠道类型元数据。
+export interface NotificationKind {
+  kind: string;
+  default_rate_per_min: number;
+  secret_keys: string[];
+}
+
+export interface NotificationMeta {
+  kinds: NotificationKind[];
+  enabled: boolean;
+  public_base_url: string;
+  digest_interval_min: string;
+  defaults: { digest_interval_min: number };
+  stats: {
+    channels: number;
+    channels_on: number;
+    pending: number;
+    failed: number;
+    sent_today: number;
+    backlog_age_ms: number;
+  };
+}
+
+// NotificationDelivery 是一条投递记录，用于投递历史与失败重发。
+export interface NotificationDelivery {
+  id: number;
+  finding_id: string;
+  event_kind: string; // finding_created | finding_status_changed
+  channel_id: number;
+  channel_name: string;
+  channel_kind: string;
+  state: "pending" | "sending" | "sent" | "failed" | "skipped";
+  attempts: number;
+  last_error: string;
+  batch_id?: number;
+  created_at: string;
+  sent_at?: string;
+  next_attempt_at: string;
+  title: string;
+  severity: string;
 }
 
 // ---- LLM config ----

@@ -1284,3 +1284,103 @@ ALTER TABLE task_intercept_rules ADD COLUMN IF NOT EXISTS action TEXT NOT NULL D
 DROP TRIGGER IF EXISTS trg_task_intercept_rules_upd ON task_intercept_rules;
 CREATE TRIGGER trg_task_intercept_rules_upd BEFORE UPDATE ON task_intercept_rules
     FOR EACH ROW EXECUTE FUNCTION set_updated_at();
+
+-- =====================================================================
+-- M. 漏洞 IM 推送
+--
+-- 三张表刻意分开，核心是**爆炸半径**：写漏洞的那个事务(RecordFindingTx，
+-- 持任务行锁)只允许做一次盲 INSERT，不读渠道表、不跑用户的过滤规则。否则
+-- 一条配错的 webhook 过滤条件就能污染/中止事务，导致漏洞存不进去。
+--
+--   notification_channels   渠道实例配置(可变、含凭据、UI 管理)
+--   notification_events     事件事实(写漏洞事务内盲插，含渲染快照)
+--   notification_deliveries 投递任务(事务外 fan-out 产生，承载状态/重试/批次)
+-- =====================================================================
+
+-- 渠道实例：同一 kind 可配任意多个(如「应急群」「日常群」各一个钉钉机器人)。
+-- kind 取值由 server 侧白名单校验，不加 CHECK：与 findings.status 同理，
+-- 后续加渠道不应要求改表结构。
+CREATE TABLE IF NOT EXISTS notification_channels (
+    id           BIGSERIAL PRIMARY KEY,
+    name         TEXT NOT NULL,
+    -- dingtalk 钉钉 / feishu 飞书 / wecom 企业微信 / webhook 通用 / telegram / email
+    kind         TEXT NOT NULL,
+    enabled      BOOLEAN NOT NULL DEFAULT true,
+    -- 凭据(明文存储，UI 掩码回显；见 server 侧 maskChannelSecrets)。六种渠道字段差异极大，
+    -- 统一 JSONB + Go 侧按 kind 严格校验，避免为每渠道加一堆 NULL 列：
+    --   dingtalk {webhook,secret}
+    --   feishu   {webhook,secret}
+    --   wecom    {webhook}
+    --   webhook  {url,method,content_type,headers{},body_template}
+    --   telegram {bot_token,chat_id,base_url}
+    --   email    {host,port,username,password,from,to[],tls}
+    config       JSONB NOT NULL DEFAULT '{}',
+    -- 推送时机：realtime 命中即推 / digest 进批次按全局周期汇总成一条。
+    mode         TEXT NOT NULL DEFAULT 'realtime',
+    -- 过滤条件，字段全部可选(缺省=不过滤)：
+    --   min_severity       ''|low|medium|high|critical
+    --   task_ids/asset_ids 空数组=不限；非空则须交集非空
+    --   vulnclass_include/exclude 关键词数组(大小写不敏感子串)；include 空=全收
+    --   on_status_change   bool，仅 realtime 模式有意义
+    filter       JSONB NOT NULL DEFAULT '{}',
+    -- 每分钟投递上限；0=不限流。默认 20 对齐钉钉/企微官方硬限。
+    -- 超限不丢消息，只把投递推迟到下一个 tick。
+    rate_per_min INTEGER NOT NULL DEFAULT 20,
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at   TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+DROP TRIGGER IF EXISTS trg_notification_channels_upd ON notification_channels;
+CREATE TRIGGER trg_notification_channels_upd BEFORE UPDATE ON notification_channels
+    FOR EACH ROW EXECUTE FUNCTION set_updated_at();
+
+-- 事件事实。由 RecordFindingTx / 状态变更事务**同事务**写入，保证「漏洞落库」
+-- 与「推送任务存在」原子一致——不存在提交成功但没入队、消息永久丢失的窗口。
+-- snapshot 刻意冗余：漏洞事后会被改名/改级别/改状态，推送内容应反映「事发当时」，
+-- 且 fan-out 与渲染不必回查 findings/tasks/assets 多张表。
+-- finding 删除后事件不级联删除：与 findings 表「任务删除仍独立留存」的语义一致。
+CREATE TABLE IF NOT EXISTS notification_events (
+    id         BIGSERIAL PRIMARY KEY,
+    -- finding_created | finding_status_changed
+    kind       TEXT NOT NULL,
+    finding_id BIGINT NOT NULL,
+    snapshot   JSONB NOT NULL,
+    -- fan-out 幂等标记：dispatcher 按此列取待分派事件，处理完置 true。
+    -- 用列而非删行，以便投递历史能回溯到事件。
+    fanned_out BOOLEAN NOT NULL DEFAULT false,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_notification_events_pending
+    ON notification_events(id) WHERE NOT fanned_out;
+
+-- 投递任务：一条事件 × 一个启用渠道 = 一行。fan-out 在事务外做，所以渠道
+-- 后开不会补历史(与 agent_triggers 的「迟开 trigger 不补历史」语义一致，
+-- 避免启用渠道时一次性刷屏历史积压)。
+-- channel_id 级联删除：渠道配置都没了，其投递历史无意义。
+CREATE TABLE IF NOT EXISTS notification_deliveries (
+    id          BIGSERIAL PRIMARY KEY,
+    event_id    BIGINT NOT NULL REFERENCES notification_events(id) ON DELETE CASCADE,
+    channel_id  BIGINT NOT NULL REFERENCES notification_channels(id) ON DELETE CASCADE,
+    -- pending 待发 / sent 已发 / failed 重试耗尽(可手动重发) / skipped 渠道停用或批次取消
+    -- pending 待发 / sending 已被某 dispatcher 领取(租约未到期) / sent 已发 /
+    -- failed 重试耗尽或永久失败(可手动重发) / skipped 渠道停用。取值不加 CHECK，
+    -- 与 findings.status 同理，由 server 侧白名单校验。
+    state       TEXT NOT NULL DEFAULT 'pending',
+    attempts    INTEGER NOT NULL DEFAULT 0,
+    -- 兼作「下次可领取时间」与「租约到期时间」：领取时把它推到未来即构成租约，
+    -- 于是「租约未到期」与「未到重试时间」共用同一个条件表达，不需要额外的
+    -- lease_until 列。进程崩溃留下的 sending 行会因租约到期被下一轮重新领取。
+    next_attempt_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    last_error  TEXT NOT NULL DEFAULT '',
+    -- digest 模式同批次共享；realtime 恒为 NULL。整批渲染成一条消息后一起置 sent。
+    batch_id    BIGINT,
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    sent_at     TIMESTAMPTZ
+);
+CREATE INDEX IF NOT EXISTS idx_notification_deliveries_due
+    ON notification_deliveries(next_attempt_at) WHERE state='pending';
+CREATE INDEX IF NOT EXISTS idx_notification_deliveries_history
+    ON notification_deliveries(id DESC);
+CREATE INDEX IF NOT EXISTS idx_notification_deliveries_batch
+    ON notification_deliveries(batch_id) WHERE batch_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_notification_deliveries_channel
+    ON notification_deliveries(channel_id, id DESC);
