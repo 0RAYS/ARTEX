@@ -154,3 +154,104 @@ func TestReclaimOnLegacyIndexIsHarmless(t *testing.T) {
 		t.Fatal("旧库居然回收了空闲页，说明测试没有真的构造出旧库")
 	}
 }
+
+// TestDeleteAllPurgesAndCompacts covers the page's clear-everything action: it
+// must leave nothing behind — including host directories the index no longer
+// knows about — and it must hand the index space back, since an emptied index is
+// the one moment a full rewrite is cheap.
+func TestDeleteAllPurgesAndCompacts(t *testing.T) {
+	tr, dir := openTraffic(t)
+	bulkRecord(tr, "a.example.com", 10, 200*1024)
+	bulkRecord(tr, "b.example.com", 10, 200*1024)
+	// A text body so the full-text index has real content, and a spilled one so a
+	// blob exists to collect.
+	tr.record(newFlow("c.example.com", "GET", "/page", nil, []byte(strings.Repeat("secret-token ", 500))))
+	tr.record(newFlow("c.example.com", "GET", "/big", nil,
+		[]byte(strings.Repeat("B", maxInlineBody+1024)), withRespType("application/sql")))
+	// An orphaned legacy directory: no index row points at it, so only a
+	// clear-everything should take it.
+	orphan := filepath.Join(dir, "orphan.example.com")
+	if err := os.MkdirAll(orphan, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	grown := tr.indexBytes()
+	if grown < 5<<20 {
+		t.Fatalf("索引只有 %d 字节，样本不足", grown)
+	}
+
+	deleted, reclaimed, err := tr.DeleteAll()
+	if err != nil {
+		t.Fatalf("DeleteAll: %v", err)
+	}
+	if deleted != 22 {
+		t.Fatalf("deleted=%d，应为 22", deleted)
+	}
+	tr.reaping.Wait()
+
+	if reclaimed < grown/2 {
+		t.Fatalf("只回收了 %d 字节（删除前索引 %d）", reclaimed, grown)
+	}
+	if after := tr.indexBytes(); after > grown/8 {
+		t.Fatalf("清空后索引仍占 %d 字节（删除前 %d）", after, grown)
+	}
+	for _, q := range []string{
+		`SELECT COUNT(*) FROM exchanges`,
+		`SELECT COUNT(*) FROM exchange_bodies`,
+		`SELECT COUNT(*) FROM blob_refs`,
+	} {
+		var c int
+		if err := tr.DB().QueryRow(q).Scan(&c); err != nil {
+			t.Fatal(err)
+		}
+		if c != 0 {
+			t.Fatalf("%s = %d，应为 0", q, c)
+		}
+	}
+	if _, err := os.Stat(orphan); !os.IsNotExist(err) {
+		t.Fatalf("孤立的历史 host 目录未被清理：%v", err)
+	}
+	// Recording must keep working against the freshly rewritten file.
+	tr.record(newFlow("d.example.com", "GET", "/after", nil, []byte("清空后仍可录制")))
+	if n, err := tr.Count(); err != nil || n != 1 {
+		t.Fatalf("清空后 Count=(%d,%v)，应为 (1,nil)", n, err)
+	}
+}
+
+// TestDeleteAllConvertsLegacyIndex is why the purge compacts rather than just
+// deleting: auto_vacuum cannot be switched on after the fact except through a
+// VACUUM, and an emptied index is the cheapest place to pay for one. After this,
+// ordinary deletions reclaim space on their own.
+func TestDeleteAllConvertsLegacyIndex(t *testing.T) {
+	dir := t.TempDir()
+	old := openLegacyIndex(t, dir)
+	if err := old.Close(); err != nil {
+		t.Fatal(err)
+	}
+	tr, err := Open(dir, "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { tr.Close() })
+	if tr.incrementalVacuum {
+		t.Fatal("旧库不应报告已启用增量回收")
+	}
+
+	bulkRecord(tr, "legacy.example.com", 10, 200*1024)
+	if _, _, err := tr.DeleteAll(); err != nil {
+		t.Fatalf("DeleteAll: %v", err)
+	}
+	if !tr.incrementalVacuum {
+		t.Fatal("清空后旧库未被转换为增量回收模式")
+	}
+
+	// The converted database now reclaims on an ordinary host deletion.
+	bulkRecord(tr, "again.example.com", 10, 200*1024)
+	grown := tr.indexBytes()
+	if _, err := tr.DeleteHostsExact([]string{"again.example.com"}); err != nil {
+		t.Fatal(err)
+	}
+	tr.reaping.Wait()
+	if after := tr.indexBytes(); after > grown/4 {
+		t.Fatalf("转换后普通删除仍未回收：%d 字节（删除前 %d）", after, grown)
+	}
+}
