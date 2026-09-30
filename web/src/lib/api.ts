@@ -791,6 +791,9 @@ export const api = {
   trafficHosts: () => get<{ hosts: TrafficHost[] }>(`/traffic/hosts`),
   trafficDeleteHost: (host: string) => del<{ deleted: number }>(`/traffic?host=${encodeURIComponent(host)}`),
   trafficDeleteHosts: (hosts: string[]) => del<{ deleted: number }>(`/traffic/hosts`, { hosts }),
+  // Purges every exchange and compacts the index; `reclaimed` is the bytes of
+  // index handed back to the filesystem. Evidence bound to findings is kept.
+  trafficDeleteAll: () => del<{ deleted: number; reclaimed: number }>(`/traffic/all`),
 
   // ---- app settings (runtime toggles) ----
   settings: () => get<Settings>(`/settings`),

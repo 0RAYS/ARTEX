@@ -1066,6 +1066,116 @@ func (t *Traffic) DeleteHost(host string) (int64, error) {
 	return n, nil
 }
 
+// DeleteAll removes every recorded exchange — the page's clear-everything
+// action. It differs from the host-scoped deletions in two ways. It sweeps host
+// directories without consulting the index, because "clear everything" should
+// leave nothing behind and a directory whose rows are already gone would
+// otherwise survive. And it ends with a full compaction: VACUUM costs what it
+// keeps, so an emptied index is the one moment it is free, and it is also the
+// only way to switch on auto_vacuum for a database created without it.
+//
+// Evidence already bound to a finding is untouched. Those bodies were copied
+// into the evidence store when they were bound, precisely so that disposable
+// traffic could be cleared without taking proof with it.
+//
+// Returns the number of exchanges deleted and how many bytes of index the
+// compaction handed back.
+func (t *Traffic) DeleteAll() (deleted int64, reclaimed int64, err error) {
+	t.wmu.Lock()
+	defer t.wmu.Unlock()
+	before := t.indexBytes()
+	trees, err := t.allHostTrees()
+	if err != nil {
+		return 0, 0, err
+	}
+	tx, err := t.db.Begin()
+	if err != nil {
+		return 0, 0, err
+	}
+	defer tx.Rollback() //nolint:errcheck // no-op once committed
+	if deleted, err = t.deleteWhere(tx, `1=1`); err != nil {
+		return 0, 0, err
+	}
+	// Staged before the commit so a filesystem failure can still abort the whole
+	// deletion, exactly as in DeleteHost.
+	stageDir, moves, err := t.stageTrees(trees)
+	if err != nil {
+		return 0, 0, errors.Join(err, restoreTrees(stageDir, moves))
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, 0, errors.Join(fmt.Errorf("提交流量索引删除: %w", err), restoreTrees(stageDir, moves))
+	}
+	t.reapStage(stageDir)
+	if err := t.gcBlobs(); err != nil {
+		return deleted, 0, err
+	}
+	if err := t.compactIndex(); err != nil {
+		// The deletion is already durable; compaction is disk space, not
+		// correctness, so it must not turn a completed purge into a failed one.
+		log.Printf("[traffic] 压实索引失败：%v", err)
+		return deleted, 0, nil
+	}
+	return deleted, before - t.indexBytes(), nil
+}
+
+// allHostTrees lists every host directory left by the pre-SQLite layout. Unlike
+// hostTrees it does not go through the index, so it also finds directories whose
+// rows are already gone. Underscore-prefixed entries are the store's own
+// (_index, _blobs, _ca, _delete_staging) and are never hosts.
+func (t *Traffic) allHostTrees() ([]string, error) {
+	entries, err := os.ReadDir(t.dir)
+	if err != nil {
+		return nil, err
+	}
+	var dirs []string
+	for _, e := range entries {
+		if e.IsDir() && !strings.HasPrefix(e.Name(), "_") {
+			dirs = append(dirs, filepath.Join(t.dir, e.Name()))
+		}
+	}
+	return dirs, nil
+}
+
+// compactIndex rewrites the index into a fresh file, which is what actually
+// returns its pages to the filesystem. VACUUM's runtime and temporary space
+// scale with the content it keeps, so this is only reached right after DeleteAll
+// has emptied the index — never as a routine step. It doubles as the conversion
+// path for a database created before auto_vacuum=incremental: that pragma only
+// takes effect through the VACUUM that follows it, and both must run on the same
+// connection. Callers must hold wmu.
+func (t *Traffic) compactIndex() error {
+	ctx := context.Background()
+	conn, err := t.db.Conn(ctx)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+	if t.fts {
+		// A full merge, not the bounded one reclaim uses: with the index emptied
+		// there is nothing left to merge, so this only discards the tombstones.
+		if _, err := conn.ExecContext(ctx, `INSERT INTO ex_fts(ex_fts) VALUES('optimize')`); err != nil {
+			return fmt.Errorf("合并全文索引: %w", err)
+		}
+	}
+	if _, err := conn.ExecContext(ctx, `PRAGMA auto_vacuum=incremental`); err != nil {
+		return err
+	}
+	if _, err := conn.ExecContext(ctx, `VACUUM`); err != nil {
+		return fmt.Errorf("压实索引: %w", err)
+	}
+	var mode int
+	if err := conn.QueryRowContext(ctx, `PRAGMA auto_vacuum`).Scan(&mode); err != nil {
+		return err
+	}
+	// A legacy database has just been converted, so later deletions can reclaim
+	// space on their own instead of waiting for another purge.
+	t.incrementalVacuum = mode == autoVacuumIncremental
+	if _, err := conn.ExecContext(ctx, `PRAGMA wal_checkpoint(TRUNCATE)`); err != nil {
+		return fmt.Errorf("截断 WAL: %w", err)
+	}
+	return nil
+}
+
 // deleteWhere removes every trace of the exchanges matching the condition:
 // full-text index rows, bodies, blob references, and finally the index rows.
 // Order matters — each sub-select reads exchanges, so that table is emptied last.

@@ -784,6 +784,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/traffic/hosts", s.getTrafficHosts)
 	mux.HandleFunc("DELETE /api/traffic", s.deleteTraffic)
 	mux.HandleFunc("DELETE /api/traffic/hosts", s.deleteTrafficHosts)
+	mux.HandleFunc("DELETE /api/traffic/all", s.deleteAllTraffic)
 	mux.HandleFunc("GET /api/traffic/exchange", s.getTrafficExchange)
 	mux.HandleFunc("GET /api/traffic/blob", s.getTrafficBlob)
 	mux.HandleFunc("GET /api/commands", s.pgListCommands)
@@ -3183,6 +3184,25 @@ func (s *Server) deleteTrafficHosts(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, 200, map[string]any{"deleted": n})
+}
+
+// deleteAllTraffic purges every recorded exchange, then compacts the index so
+// the space is actually returned to the filesystem — an emptied index is the one
+// moment a full rewrite is cheap. Evidence already bound to a finding lives in
+// the evidence store and is deliberately left alone. Returns the number of
+// exchanges deleted and the bytes of index reclaimed.
+func (s *Server) deleteAllTraffic(w http.ResponseWriter, r *http.Request) {
+	tr := s.m.Traffic()
+	if tr == nil {
+		writeErr(w, 404, "traffic disabled")
+		return
+	}
+	n, reclaimed, err := tr.DeleteAll()
+	if err != nil {
+		writeErr(w, 500, err.Error())
+		return
+	}
+	writeJSON(w, 200, map[string]any{"deleted": n, "reclaimed": reclaimed})
 }
 
 // getTrafficExchange returns the full raw request/response of one exchange,
