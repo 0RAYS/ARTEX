@@ -18,7 +18,6 @@ import {
 
 import { Button } from "@/components/ui/button";
 import { InputGroup, InputGroupAddon, InputGroupInput } from "@/components/ui/input-group";
-import { ScrollArea } from "@/components/ui/scroll-area";
 import type { FindingAssetKind, FindingAssetNode } from "@/lib/types";
 import { cn } from "@/lib/utils";
 
@@ -299,12 +298,12 @@ export function AssetTree({
         <span className="text-xs tabular-nums text-muted-foreground">{findingTotal}</span>
       </button>
 
-      <ScrollArea className="min-h-0 flex-1">
-        <div className="flex flex-col pr-2">
+      <div className="max-h-[24rem] min-h-0 flex-1 overflow-y-auto pr-2 lg:max-h-[calc(100vh-16rem)]">
+        <div className="flex flex-col">
           {rows}
           {rows.length === 0 && <p className="px-2 py-8 text-center text-xs text-muted-foreground">{emptyHint}</p>}
         </div>
-      </ScrollArea>
+      </div>
 
       {truncated && (
         <p className="px-1 text-xs text-muted-foreground">

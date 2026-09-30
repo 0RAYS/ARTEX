@@ -964,7 +964,7 @@ export default function FindingsPage() {
         {view === "asset" && (
           <div className="grid min-h-0 items-start gap-4 lg:grid-cols-[20rem_minmax(0,1fr)] xl:grid-cols-[24rem_minmax(0,1fr)]">
             <Card className="gap-0 py-3 lg:sticky lg:top-4">
-              <CardContent className="flex max-h-[24rem] flex-col px-3 lg:max-h-[calc(100vh-14rem)]">
+              <CardContent className="flex flex-col px-3">
                 {assetTree.loading && !assetTree.loaded ? (
                   <div className="flex min-h-36 items-center justify-center">
                     <Spinner />
