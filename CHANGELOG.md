@@ -4,7 +4,11 @@
 
 ## [Unreleased]
 
-### 流量
+### 拦截
+
+#### 新增的功能
+
+- **新增内置拦截规则「删除类接口路径」**：此前内置的 HTTP 破坏性规则只认 DELETE **方法**（`curl -X DELETE`、`requests.delete(`、`method:'DELETE'`），路径类规则的词表又只有 `/clear /wipe /flush /purge /truncate /drop /destroy /factory-reset /reset-all`——而多数应用的删除接口用 GET/POST 就能触发，于是 `curl 'http://t/api/user/delete?id=1'` 这类调用不命中任何内置规则，会真实删掉目标数据。现补一条 `deny` 规则覆盖 `/delete /del /remove /unlink /erase /destroy`（允许 `/deleteAll`、`/delete_user`、`/delete-user` 这类后缀形式），动词后必须跟分隔符，`/delivery`、`/details`、`/delta`、`/delegate` 不会被误拦。规则走独立的种子标记位，**已有实例升级后也会拿到**；和其余内置规则一样可在「系统 → 命令拦截」里停用或删除。
 
 #### 新增的功能
 
