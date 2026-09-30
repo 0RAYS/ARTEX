@@ -102,6 +102,30 @@ const (
 	// maxBlobRead caps one traffic_blob read so paging through a large body never
 	// floods the agent's context.
 	maxBlobRead = 8 * 1024
+	// autoVacuumIncremental is SQLite's numeric value for auto_vacuum=incremental.
+	autoVacuumIncremental = 2
+	// reclaimChunkPages bounds how much index space one locked step returns to the
+	// filesystem (pages are 4KiB, so ~32MB). Reclamation holds the write lock, and
+	// record() runs before go-mitmproxy replies to the client, so an unbounded
+	// pass would stall the very requests being recorded.
+	reclaimChunkPages = 8192
+	// reclaimMergePages bounds the full-text merge done alongside each chunk.
+	// Deleting from a contentless_delete index only writes tombstones; merging is
+	// what discards them, and left undone the index grows on every deletion.
+	reclaimMergePages = 256
+	// reclaimMergeSteps bounds how many merges one reclamation performs. fts5
+	// offers no way to ask whether an index has settled — its special INSERT
+	// registers a row change of its own, so change counting cannot tell a real
+	// merge from a no-op — so the budget is simply spent down, and whatever is
+	// left over falls to the next deletion.
+	reclaimMergeSteps = 16
+	// reclaimMaxSteps backstops the loop. Both merging and incremental_vacuum are
+	// documented to stop making progress eventually, but a reclamation that cannot
+	// converge must give up rather than spin holding the write lock.
+	reclaimMaxSteps = 512
+	// reclaimBudget caps one background reclamation. Deleting a busy host can free
+	// gigabytes, and the next deletion resumes wherever this one stopped.
+	reclaimBudget = 5 * time.Minute
 )
 
 // TrafficSearchDescription is persisted into the tool catalog for new and
@@ -121,9 +145,22 @@ type Traffic struct {
 	// build without FTS5: recording and metadata search still work, body search
 	// degrades to unsupported rather than erroring.
 	fts bool
-	// reaping tracks background reclamation of legacy trees, so shutdown and tests
-	// can wait for it instead of racing it.
+	// reaping tracks background reclamation of legacy trees and index space, so
+	// shutdown and tests can wait for it instead of racing it.
 	reaping sync.WaitGroup
+	// incrementalVacuum reports whether the index can return freed pages to the
+	// filesystem on its own. False on a database created before this was the
+	// default: PRAGMA incremental_vacuum is a silent no-op there, so deletions
+	// reclaim nothing until an explicit full compaction converts the file.
+	incrementalVacuum bool
+	// reclaiming keeps a single background reclamation in flight. Concurrent ones
+	// would only contend for wmu, never finish sooner.
+	reclaiming atomic.Bool
+	// closed is shut by Close so a reclamation abandons its remaining budget
+	// instead of holding shutdown open for minutes. Nil on the zero value, which
+	// stopping() treats as "not closing".
+	closed    chan struct{}
+	closeOnce sync.Once
 	// pass is the set of hosts whose MITM interception failed for a proxy/protocol
 	// reason; connections to them are tunneled transparently (fail-open) so the
 	// request still reaches the target — unrecorded — instead of being killed.
@@ -142,25 +179,26 @@ func Open(dir, addr string) (*Traffic, error) {
 			return nil, err
 		}
 	}
-	db, err := sql.Open("sqlite", filepath.Join(dir, "_index", "index.sqlite"))
+	// busy_timeout is a per-connection setting, so it belongs in the DSN rather
+	// than in a one-off Exec: the pool opens connections on demand, and an Exec
+	// only configures whichever one happened to serve it — leaving every other
+	// connection to fail instantly the moment a writer holds the database.
+	// The driver splits the DSN at the first '?', so a data directory containing
+	// one would silently name a different file; that path falls back to a bare
+	// DSN, where initIndex still applies the pragmas to its own connection.
+	index := filepath.Join(dir, "_index", "index.sqlite")
+	dsn := index
+	if !strings.ContainsRune(index, '?') {
+		dsn = "file:" + index + "?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)"
+	}
+	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, err
 	}
-	for _, p := range []string{"PRAGMA journal_mode=WAL", "PRAGMA busy_timeout=5000"} {
-		if _, err := db.Exec(p); err != nil {
-			db.Close()
-			return nil, err
-		}
-	}
-	if _, err := db.Exec(indexSchema); err != nil {
+	t := &Traffic{dir: dir, addr: addr, db: db, closed: make(chan struct{})}
+	if err := t.initIndex(); err != nil {
 		db.Close()
 		return nil, err
-	}
-	t := &Traffic{dir: dir, addr: addr, db: db}
-	if _, err := db.Exec(ftsSchema); err != nil {
-		log.Printf("[traffic] 全文索引不可用，正文搜索将被禁用（元数据搜索不受影响）：%v", err)
-	} else {
-		t.fts = true
 	}
 
 	p, err := mproxy.NewProxy(&mproxy.Options{
@@ -191,6 +229,66 @@ func Open(dir, addr string) (*Traffic, error) {
 	p.AddAddon(&sink{t: t})
 	t.proxy = p
 	return t, nil
+}
+
+// initIndex applies the schema on a single pinned connection. Pinning is what
+// makes auto_vacuum reliable: it can only be set while the database still holds
+// no tables, and only the VACUUM that follows writes it into the file header —
+// two steps a pooled *sql.DB is free to route to different connections, which
+// would silently drop the setting.
+//
+// auto_vacuum=incremental is what lets a deletion hand freed pages back to the
+// filesystem. Without it SQLite merely chains them onto its freelist, so the
+// index file never shrinks no matter how much traffic is deleted — and since
+// every body below maxInlineBody lives in that file, plus a trigram index
+// roughly twice the size of the text it covers, a capture-heavy install ends up
+// holding gigabytes for traffic it no longer has. On a database that already has
+// tables the pragma is a documented no-op, so installs created before this keep
+// auto_vacuum=0 until a full compaction converts the file; incrementalVacuum
+// records that so reclaim can say so instead of pretending to reclaim.
+func (t *Traffic) initIndex() error {
+	ctx := context.Background()
+	conn, err := t.db.Conn(ctx)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+	// Re-applied rather than left to the DSN so the bare-DSN fallback in Open is
+	// still correct: journal_mode persists in the file header, which is what every
+	// later connection reads.
+	for _, p := range []string{`PRAGMA journal_mode=WAL`, `PRAGMA busy_timeout=5000`} {
+		if _, err := conn.ExecContext(ctx, p); err != nil {
+			return err
+		}
+	}
+	var tables int
+	if err := conn.QueryRowContext(ctx, `SELECT count(*) FROM sqlite_master WHERE type='table'`).Scan(&tables); err != nil {
+		return err
+	}
+	if tables == 0 {
+		for _, p := range []string{`PRAGMA auto_vacuum=incremental`, `VACUUM`} {
+			if _, err := conn.ExecContext(ctx, p); err != nil {
+				return err
+			}
+		}
+	}
+	var mode int
+	if err := conn.QueryRowContext(ctx, `PRAGMA auto_vacuum`).Scan(&mode); err != nil {
+		return err
+	}
+	t.incrementalVacuum = mode == autoVacuumIncremental
+	if !t.incrementalVacuum {
+		log.Printf("[traffic] 索引库未启用增量回收（auto_vacuum=%d）：删除流量不会缩小 index.sqlite，需要执行一次存储压缩来转换", mode)
+	}
+	if _, err := conn.ExecContext(ctx, indexSchema); err != nil {
+		return err
+	}
+	if _, err := conn.ExecContext(ctx, ftsSchema); err != nil {
+		log.Printf("[traffic] 全文索引不可用，正文搜索将被禁用（元数据搜索不受影响）：%v", err)
+		return nil
+	}
+	t.fts = true
+	return nil
 }
 
 // hostOnly strips an optional :port, so passthrough keys match whether the host
@@ -262,10 +360,26 @@ func (t *Traffic) Start() error { return t.proxy.Start() }
 
 // Close waits for background tree reclamation to finish before closing the
 // index, so shutdown never leaves a goroutine unlinking files out from under a
-// removed data directory.
+// removed data directory. Index-space reclamation is signalled to stop first:
+// it holds a whole minutes-long budget, and finishing it is never worth delaying
+// shutdown for — the next deletion resumes it.
 func (t *Traffic) Close() error {
+	if t.closed != nil {
+		t.closeOnce.Do(func() { close(t.closed) })
+	}
 	t.reaping.Wait()
 	return t.db.Close()
+}
+
+// stopping reports whether Close has been called. A nil channel (the zero value)
+// is never ready, so this reads as "not closing" without a separate guard.
+func (t *Traffic) stopping() bool {
+	select {
+	case <-t.closed:
+		return true
+	default:
+		return false
+	}
 }
 func (t *Traffic) DB() *sql.DB { return t.db }
 
@@ -944,6 +1058,7 @@ func (t *Traffic) DeleteHost(host string) (int64, error) {
 	}
 	t.reapStage(stageDir)
 	if n > 0 {
+		t.reclaim()
 		if err := t.gcBlobs(); err != nil {
 			return n, err
 		}
@@ -1345,6 +1460,7 @@ func (t *Traffic) RecoverHostDeleteStages(archiveCommitted func(int64, int64) (b
 		needsGC = true
 	}
 	if needsGC {
+		t.reclaim()
 		if err := t.gcBlobs(); err != nil {
 			errs = append(errs, err)
 		}
@@ -1436,6 +1552,7 @@ func (s *HostDeleteStage) Commit() error {
 	// it now runs in the background, while collection below only needs them to be
 	// out of the live tree — which the staging rename already guaranteed.
 	s.traffic.reapStage(s.stageDir)
+	s.traffic.reclaim()
 	var errs []error
 	if err := s.traffic.gcBlobs(); err != nil {
 		errs = append(errs, fmt.Errorf("回收流量 blob: %w", err))
@@ -1443,6 +1560,127 @@ func (s *HostDeleteStage) Commit() error {
 	s.done = true
 	s.traffic.wmu.Unlock()
 	return errors.Join(errs...)
+}
+
+// indexBytes is the index's real footprint on disk: the database plus its
+// write-ahead log and shared-memory file, since those are what an operator sees
+// the data directory holding.
+func (t *Traffic) indexBytes() int64 {
+	base := filepath.Join(t.dir, "_index", "index.sqlite")
+	var total int64
+	for _, p := range []string{base, base + "-wal", base + "-shm"} {
+		if st, err := os.Stat(p); err == nil {
+			total += st.Size()
+		}
+	}
+	return total
+}
+
+// reclaim hands space freed by a deletion back to the filesystem. Deleting rows
+// only makes them invisible: SQLite chains their pages onto a freelist, and
+// deleting from the contentless_delete full-text index writes tombstones rather
+// than removing the postings they hide. Neither shrinks a single byte on disk,
+// and since bodies below maxInlineBody live in that same file, an install that
+// captures heavily ends up holding far more than the traffic it still has.
+//
+// The work is done in the background, in bounded steps that drop the write lock
+// between them, because it is proportional to what was deleted — freeing several
+// gigabytes under one lock would stall record(), which go-mitmproxy calls before
+// it replies to the client, and so would stall the requests being recorded.
+// Safe to call with wmu held: the background pass simply waits for it.
+//
+// Best-effort throughout. Failing to reclaim costs disk space, never
+// correctness, so errors are logged and the next deletion resumes the work.
+func (t *Traffic) reclaim() {
+	if !t.reclaiming.CompareAndSwap(false, true) {
+		return // one pass at a time; a second would only contend for the lock
+	}
+	t.reaping.Go(func() {
+		defer t.reclaiming.Store(false)
+		// One pinned connection for the whole pass: a long reclamation issues
+		// hundreds of statements, and letting the pool hand each one a different
+		// connection would both churn connections and split the freelist readings
+		// that decide when to stop away from the vacuum they measure.
+		ctx := context.Background()
+		conn, err := t.db.Conn(ctx)
+		if err != nil {
+			log.Printf("[traffic] 回收索引空间失败（获取连接）：%v", err)
+			return
+		}
+		defer conn.Close()
+		deadline := time.Now().Add(reclaimBudget)
+		merges := reclaimMergeSteps
+		for step := 0; ; step++ {
+			t.wmu.Lock()
+			progressed, err := t.reclaimChunk(ctx, conn, &merges)
+			t.wmu.Unlock()
+			if err != nil {
+				log.Printf("[traffic] 回收索引空间失败：%v", err)
+				return
+			}
+			if !progressed {
+				break
+			}
+			if t.stopping() {
+				return // shutdown must not wait out the remaining budget
+			}
+			if step+1 >= reclaimMaxSteps {
+				log.Printf("[traffic] 索引空间回收未做完（已用满 %d 步上限），下次删除时继续", reclaimMaxSteps)
+				return
+			}
+			if time.Now().After(deadline) {
+				log.Printf("[traffic] 索引空间回收未做完（已用满 %s 预算），下次删除时继续", reclaimBudget)
+				return
+			}
+		}
+		// Truncating the log is what makes the reclamation visible on disk: in WAL
+		// mode the freed pages are recorded there first, and a PASSIVE checkpoint
+		// would leave the log itself sitting at its high-water mark.
+		t.wmu.Lock()
+		defer t.wmu.Unlock()
+		if _, err := conn.ExecContext(ctx, `PRAGMA wal_checkpoint(TRUNCATE)`); err != nil {
+			log.Printf("[traffic] 截断 WAL 失败：%v", err)
+		}
+	})
+}
+
+// reclaimChunk does one bounded step and reports whether it made progress, which
+// is what the caller loops on. merges carries the remaining full-text merge
+// budget and is spent down here. Callers must hold wmu.
+func (t *Traffic) reclaimChunk(ctx context.Context, conn *sql.Conn, merges *int) (bool, error) {
+	progressed := false
+	if t.fts && *merges > 0 {
+		// A negative rank is fts5's page budget for one incremental merge.
+		if _, err := conn.ExecContext(ctx, `INSERT INTO ex_fts(ex_fts, rank) VALUES('merge', ?)`, -reclaimMergePages); err != nil {
+			return false, fmt.Errorf("合并全文索引: %w", err)
+		}
+		*merges--
+		progressed = true
+	}
+	if !t.incrementalVacuum {
+		// incremental_vacuum is a silent no-op on a database created with
+		// auto_vacuum=0; only a full compaction can convert one. Merging the
+		// full-text index above still pays off, so stop here rather than earlier.
+		return progressed, nil
+	}
+	var before, after int
+	if err := conn.QueryRowContext(ctx, `PRAGMA freelist_count`).Scan(&before); err != nil {
+		return false, err
+	}
+	if before == 0 {
+		return progressed, nil
+	}
+	// The budget is a constant and PRAGMA arguments cannot be bound as parameters.
+	if _, err := conn.ExecContext(ctx, fmt.Sprintf(`PRAGMA incremental_vacuum(%d)`, reclaimChunkPages)); err != nil {
+		return false, fmt.Errorf("回收索引空闲页: %w", err)
+	}
+	if err := conn.QueryRowContext(ctx, `PRAGMA freelist_count`).Scan(&after); err != nil {
+		return false, err
+	}
+	// Progress, not an empty freelist, is the right stopping condition:
+	// incremental_vacuum can only release pages it manages to move to the end of
+	// the file, so a residual freelist it cannot shrink is a normal outcome.
+	return progressed || after < before, nil
 }
 
 // gcBlobs removes blobs that no remaining exchange references. Live references
