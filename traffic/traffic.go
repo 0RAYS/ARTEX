@@ -54,6 +54,8 @@ CREATE TABLE IF NOT EXISTS exchanges (
 CREATE INDEX IF NOT EXISTS idx_ex_host ON exchanges(host);
 CREATE INDEX IF NOT EXISTS idx_ex_tmpl ON exchanges(host, url_template);
 CREATE INDEX IF NOT EXISTS idx_ex_ts   ON exchanges(ts);
+CREATE INDEX IF NOT EXISTS idx_ex_status ON exchanges(status);
+CREATE INDEX IF NOT EXISTS idx_ex_resp   ON exchanges(resp_len);
 
 CREATE TABLE IF NOT EXISTS exchange_bodies (
   id        TEXT PRIMARY KEY,
@@ -694,13 +696,53 @@ func ftsQuote(s string) string {
 	return `"` + strings.ReplaceAll(s, `"`, `""`) + `"`
 }
 
-// Page returns one page of exchange metadata filtered by an optional host
-// substring, exact method, and a free-text query q that matches across the
-// indexed metadata columns (host/url/method/content-type/status) and, when the
-// term is long enough for the trigram index, across captured request/response
-// text as well. Also returns the total number of rows matching that filter (for
-// the UI's pagination). Newest first. Bodies are never included in the rows.
-func (t *Traffic) Page(host, method, q string, page, size int) (rows []ExchangeMeta, total int, err error) {
+// PageQuery bundles the optional filters and sort order for Page. Every filter
+// is combined with AND; an empty string skips that filter, and RespMin/RespMax
+// of -1 skip the response-size bounds. An empty Sort/Order defaults to
+// newest-first by timestamp.
+type PageQuery struct {
+	Host    string // host substring
+	Method  string // exact method (case-insensitive)
+	Query   string // broad search box: metadata columns OR captured text
+	Body    string // content box: captured request/response text only (full-text)
+	Path    string // url_template substring — the vulnerability's path
+	Status  string // exact code ("404") or class bucket ("4xx")
+	RespMin int64  // minimum resp_len, or -1 when unset
+	RespMax int64  // maximum resp_len, or -1 when unset
+	Sort    string // ts | status | resp_len (default ts)
+	Order   string // asc | desc (default desc)
+}
+
+// sortColumns whitelists the columns Page may order by, so the caller-supplied
+// Sort can never reach the SQL as anything but one of these fixed names.
+var sortColumns = map[string]string{"ts": "ts", "status": "status", "resp_len": "resp_len"}
+
+// statusFilter turns a status token into a SQL condition: an exact code ("404")
+// matches that status, an "Nxx" class ("4xx") matches the whole hundreds band.
+// ok is false for an empty or unrecognized token.
+func statusFilter(s string) (cond string, args []any, ok bool) {
+	s = strings.ToLower(strings.TrimSpace(s))
+	if s == "" {
+		return "", nil, false
+	}
+	if len(s) == 3 && s[0] >= '1' && s[0] <= '5' && s[1] == 'x' && s[2] == 'x' {
+		base := int(s[0]-'0') * 100
+		return "status>=? AND status<?", []any{base, base + 100}, true
+	}
+	if n, err := strconv.Atoi(s); err == nil {
+		return "status=?", []any{n}, true
+	}
+	return "", nil, false
+}
+
+// Page returns one page of exchange metadata for the traffic list, filtered by
+// the criteria in f (all optional, combined with AND) and ordered by the
+// requested column. Query is the broad search box (metadata columns OR, when the
+// term is long enough for the trigram index, captured request/response text);
+// Body narrows to exchanges whose captured text matches, via that same index.
+// Also returns the total number of rows matching the filter (for the UI's
+// pagination). Bodies are never included in the rows.
+func (t *Traffic) Page(f PageQuery, page, size int) (rows []ExchangeMeta, total int, err error) {
 	if size <= 0 || size > 500 {
 		size = 100
 	}
@@ -718,13 +760,25 @@ func (t *Traffic) Page(host, method, q string, page, size int) (rows []ExchangeM
 		where += cond
 		args = append(args, vs...)
 	}
-	if h := strings.TrimSpace(host); h != "" {
+	if h := strings.TrimSpace(f.Host); h != "" {
 		add("host LIKE ?", "%"+h+"%")
 	}
-	if m := strings.TrimSpace(method); m != "" {
+	if m := strings.TrimSpace(f.Method); m != "" {
 		add("method=?", strings.ToUpper(m))
 	}
-	if s := strings.TrimSpace(q); s != "" {
+	if p := strings.TrimSpace(f.Path); p != "" {
+		add("url_template LIKE ?", "%"+p+"%")
+	}
+	if cond, sargs, ok := statusFilter(f.Status); ok {
+		add(cond, sargs...)
+	}
+	if f.RespMin >= 0 {
+		add("resp_len>=?", f.RespMin)
+	}
+	if f.RespMax >= 0 {
+		add("resp_len<=?", f.RespMax)
+	}
+	if s := strings.TrimSpace(f.Query); s != "" {
 		like := "%" + s + "%"
 		const meta = "host LIKE ? OR url LIKE ? OR url_template LIKE ? OR method LIKE ? OR content_type LIKE ? OR CAST(status AS TEXT) LIKE ?"
 		// Metadata match OR full-text match: one search box, widest recall. Terms
@@ -735,11 +789,30 @@ func (t *Traffic) Page(host, method, q string, page, size int) (rows []ExchangeM
 			add("("+meta+")", like, like, like, like, like, like)
 		}
 	}
+	// Body is the dedicated content box: it only searches captured request/response
+	// text, so it goes straight to the full-text index with no metadata fallback. A
+	// term too short for the trigram tokenizer cannot be served and is skipped
+	// rather than guessed at — the UI hints at the three-character minimum.
+	if b := strings.TrimSpace(f.Body); b != "" {
+		if cond, arg, ok := t.ftsFilter(b); ok {
+			add(cond, arg)
+		}
+	}
 	if err = t.db.QueryRow(`SELECT COUNT(*) FROM exchanges`+where, args...).Scan(&total); err != nil {
 		return nil, 0, err
 	}
+	col := sortColumns[strings.ToLower(strings.TrimSpace(f.Sort))]
+	if col == "" {
+		col = "ts"
+	}
+	dir := "DESC"
+	if strings.EqualFold(strings.TrimSpace(f.Order), "asc") {
+		dir = "ASC"
+	}
+	// id embeds capture timestamp + sequence, so a trailing id DESC makes the order
+	// total and pagination stable even when the sort column has many ties.
 	sel := `SELECT id,ts,host,method,url_template,url,status,content_type,resp_len,path FROM exchanges` +
-		where + ` ORDER BY ts DESC LIMIT ? OFFSET ?`
+		where + ` ORDER BY ` + col + ` ` + dir + `, id DESC LIMIT ? OFFSET ?`
 	qargs := append(append([]any{}, args...), size, page*size)
 	rs, err := t.db.Query(sel, qargs...)
 	if err != nil {

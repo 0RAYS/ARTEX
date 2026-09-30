@@ -758,12 +758,34 @@ export const api = {
 
   // ---- traffic / audit / report / chat ----
   audit: (task?: string) => get<Audit>(`/audit${tq(task)}`),
-  traffic: (page = 0, size = 100, host = "", method = "", q = "") =>
+  traffic: (
+    page = 0,
+    size = 100,
+    host = "",
+    method = "",
+    q = "",
+    opts: {
+      body?: string;
+      path?: string;
+      status?: string;
+      respMin?: string;
+      respMax?: string;
+      sort?: string;
+      order?: string;
+    } = {},
+  ) =>
     get<TrafficResp>(
       `/traffic?page=${page}&size=${size}` +
         (host ? `&host=${encodeURIComponent(host)}` : "") +
         (method && method !== "all" ? `&method=${encodeURIComponent(method)}` : "") +
-        (q ? `&q=${encodeURIComponent(q)}` : ""),
+        (q ? `&q=${encodeURIComponent(q)}` : "") +
+        (opts.body ? `&body=${encodeURIComponent(opts.body)}` : "") +
+        (opts.path ? `&path=${encodeURIComponent(opts.path)}` : "") +
+        (opts.status && opts.status !== "all" ? `&status=${encodeURIComponent(opts.status)}` : "") +
+        (opts.respMin ? `&resp_min=${encodeURIComponent(opts.respMin)}` : "") +
+        (opts.respMax ? `&resp_max=${encodeURIComponent(opts.respMax)}` : "") +
+        (opts.sort ? `&sort=${encodeURIComponent(opts.sort)}` : "") +
+        (opts.order ? `&order=${encodeURIComponent(opts.order)}` : ""),
     ),
   trafficExchange: (id: string) => get<TrafficDetail>(`/traffic/exchange?id=${encodeURIComponent(id)}`),
   trafficHosts: () => get<{ hosts: TrafficHost[] }>(`/traffic/hosts`),
