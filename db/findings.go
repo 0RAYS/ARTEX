@@ -690,6 +690,10 @@ func (d *DB) DeleteFindingsByTask(taskID int64) (int64, error) {
 }
 
 // SetFindingStatus updates one finding's triage state. Returns rows affected.
+//
+// 底层 setter：只改状态、不登记推送事件。生产代码改状态请走
+// SetFindingStatusWithNotify —— 直接调本函数会让「状态变更推送」静默失效。
+// 保留它是为了让不关心通知的用例（参数校验、复测流程）能单独驱动状态。
 func (d *DB) SetFindingStatus(id int64, status string) (int64, error) {
 	res, err := d.Exec(`UPDATE findings SET status=$1 WHERE id=$2`, status, id)
 	if err != nil {

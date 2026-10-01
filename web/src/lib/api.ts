@@ -64,6 +64,10 @@ import type {
   MCPTool,
   MissingSkill,
   ModelTokenStat,
+  NotificationChannel,
+  NotificationDelivery,
+  NotificationFilter,
+  NotificationMeta,
   PromptVar,
   PromptVersion,
   SessionTokenUsage,
@@ -805,6 +809,49 @@ export const api = {
     brave_search_api_key?: string;
     tavily_search_api_key?: string;
   }) => post<{ ok: boolean; error?: string; count?: number; backend?: string }>(`/settings/web-search/test`, patch),
+
+  // ---- 漏洞 IM 推送 ----
+  // 渠道是多实例资源（同一类型可配多个机器人、各有过滤规则），因此独立成组，
+  // 不塞进扁平的 settings 键值里。
+  notifyMeta: () => get<NotificationMeta>(`/notify/meta`),
+  notifyChannels: () =>
+    get<{ channels: NotificationChannel[] }>(`/notify/channels`).then((r) => arr(r.channels)),
+  notifyCreateChannel: (payload: {
+    name: string;
+    kind: string;
+    enabled?: boolean;
+    mode?: string;
+    config: Record<string, unknown>;
+    filter?: NotificationFilter;
+    rate_per_min?: number;
+  }) => post<{ id: number }>(`/notify/channels`, payload),
+  // PATCH 语义：只提交要改的字段。config 里的掩码值原样回传即表示「保持原值」。
+  notifyUpdateChannel: (
+    id: number,
+    payload: {
+      name?: string;
+      kind?: string;
+      enabled?: boolean;
+      mode?: string;
+      config?: Record<string, unknown>;
+      filter?: NotificationFilter;
+      rate_per_min?: number;
+    },
+  ) => patch<{ id: number }>(`/notify/channels/${id}`, payload),
+  notifyDeleteChannel: (id: number) => del<{ ok: boolean }>(`/notify/channels/${id}`),
+  // 同步发一条测试消息；失败时后端会把渠道的原始错误回传，供排查配置。
+  notifyTestChannel: (id: number) => post<{ ok: boolean; latency_ms: number }>(`/notify/channels/${id}/test`),
+  notifyDeliveries: (q: { channelId?: number; state?: string; page?: number; pageSize?: number } = {}) => {
+    const p = new URLSearchParams();
+    if (q.channelId) p.set("channel_id", String(q.channelId));
+    if (q.state) p.set("state", q.state);
+    p.set("page", String(q.page ?? 1));
+    p.set("page_size", String(q.pageSize ?? 50));
+    return get<{ deliveries: NotificationDelivery[]; total: number; page: number; page_size: number }>(
+      `/notify/deliveries?${p.toString()}`,
+    ).then((r) => ({ ...r, deliveries: arr(r.deliveries) }));
+  },
+  notifyRetryDelivery: (id: number) => post<{ ok: boolean }>(`/notify/deliveries/${id}/retry`),
   report: async (task?: string) => {
     if (MOCK) return mockReport(task);
     const token = getToken();

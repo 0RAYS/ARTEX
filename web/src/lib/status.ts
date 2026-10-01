@@ -99,6 +99,16 @@ const node: Record<string, StatusMeta> = {
   tombstoned: { label: "废弃", tone: "neutral" },
 };
 
+// 推送投递状态。sending 用 blue 而不是 amber：它不是「有问题」，
+// 而是「已被领取、正在发」，与 pending 的等待语义要能区分开。
+const delivery: Record<string, StatusMeta> = {
+  pending: { label: "待发送", tone: "amber" },
+  sending: { label: "发送中", tone: "blue" },
+  sent: { label: "已送达", tone: "green" },
+  failed: { label: "失败", tone: "red" },
+  skipped: { label: "已跳过", tone: "neutral" },
+};
+
 const maps = {
   intent,
   task,
@@ -108,6 +118,7 @@ const maps = {
   goal,
   audit,
   node,
+  delivery,
 } as const;
 
 export type StatusDomain = keyof typeof maps;

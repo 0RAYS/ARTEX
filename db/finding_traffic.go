@@ -10,6 +10,8 @@ import (
 	"fmt"
 	"strings"
 	"time"
+
+	"github.com/Autumn-27/artex/notify"
 )
 
 var (
@@ -335,7 +337,9 @@ type RecordedFinding struct {
 	Traffic   *FindingTraffic `json:"traffic"`
 }
 
-func RecordFindingTx(tx *sql.Tx, in RecordFindingInput, prepared []PreparedTrafficEvidence) (*RecordedFinding, error) {
+// ctx 由调用方传入本次事务所用的上下文（而非在内部取 context.Background）：
+// 事务内新加的推送事件写入同样应受调用方的取消与超时约束。
+func RecordFindingTx(ctx context.Context, tx *sql.Tx, in RecordFindingInput, prepared []PreparedTrafficEvidence) (*RecordedFinding, error) {
 	if err := LockTaskEvidenceTx(tx, in.TaskID); err != nil {
 		return nil, err
 	}
@@ -382,6 +386,19 @@ VALUES($1,'finding',$2,9,'confirmed',$3) RETURNING id`, in.ExplorationID, string
 VALUES(NULLIF($1,0),$2,$3,$4,$5,$6,$7,$8,$9) RETURNING id`, in.TaskID, out.NodeID, in.VulnClass, in.Name, in.Severity, in.Summary, in.Evidence, in.Worker, string(raw)).Scan(&out.FindingID); err != nil {
 		return nil, err
 	}
+	// 在**同一事务**里登记一条推送事件：提交即保证「漏洞落库」与「推送任务存在」
+	// 原子一致，不存在提交成功却没入队、消息永久丢失的窗口。
+	// 这里的失败被隔离在保存点上、不影响漏洞写入（见函数注释），因此忽略返回值。
+	RecordNotificationEventTx(ctx, tx, notify.EventFindingCreated, out.FindingID, notify.Snapshot{
+		Kind:      notify.EventFindingCreated,
+		FindingID: out.FindingID,
+		TaskID:    in.TaskID,
+		VulnClass: in.VulnClass,
+		Name:      in.Name,
+		Severity:  in.Severity,
+		Summary:   in.Summary,
+		AssetIDs:  assets,
+	})
 	if err := AddFindingTrafficTx(tx, out.FindingID, prepared); err != nil {
 		return nil, err
 	}
@@ -393,7 +410,7 @@ VALUES(NULLIF($1,0),$2,$3,$4,$5,$6,$7,$8,$9) RETURNING id`, in.TaskID, out.NodeI
 // RecordFinding is the atomic legacy/no-recorder path used by tools and tests.
 func (s *ExplorationStore) RecordFinding(ctx context.Context, in RecordFindingInput) (out *RecordedFinding, err error) {
 	in.ExplorationID = s.expID
-	err = s.db.WithEvidenceTx(ctx, func(tx *sql.Tx) error { var e error; out, e = RecordFindingTx(tx, in, nil); return e })
+	err = s.db.WithEvidenceTx(ctx, func(tx *sql.Tx) error { var e error; out, e = RecordFindingTx(ctx, tx, in, nil); return e })
 	return
 }
 

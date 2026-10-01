@@ -228,6 +228,9 @@ func New(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDi
 		go s.evidenceStore().RunGC(s.ctx)
 		s.seedPythonInterpreter()     // 自定义脚本工具:开机检测 python 解释器入库(仅空时)
 		go newScheduler(s).Run(s.ctx) // P3 触发器调度(定时/finding/目标事件),仅自定义 agent
+		// 漏洞 IM 推送投递引擎。与 Scheduler 并列但独立：推送的实时性要求(3s)
+		// 与触发器的业务节奏不同，且两者失败互不牵连——推送卡住不该影响 agent 触发。
+		go newNotifier(s).Run(s.ctx)
 		// Fill the tool cache for any enabled MCP that has none yet (notably the
 		// seeded browser MCP on first run). Async so it never blocks startup.
 		go s.discoverEmptyMCPsOnStartup()
@@ -796,6 +799,16 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/llm/records/{id}", s.pgGetLLMRecord)
 	mux.HandleFunc("GET /api/settings", s.getSettings)
 	mux.HandleFunc("PUT /api/settings", s.putSettings)
+	// 漏洞 IM 推送。渠道是「多实例 + 各自过滤规则」的资源，因此独立成一组
+	// REST 接口，而不是塞进扁平的 /api/settings 键值里。
+	mux.HandleFunc("GET /api/notify/meta", s.notifyMeta)
+	mux.HandleFunc("GET /api/notify/channels", s.notifyListChannels)
+	mux.HandleFunc("POST /api/notify/channels", s.notifyCreateChannel)
+	mux.HandleFunc("PATCH /api/notify/channels/{id}", s.notifyUpdateChannel)
+	mux.HandleFunc("DELETE /api/notify/channels/{id}", s.notifyDeleteChannel)
+	mux.HandleFunc("POST /api/notify/channels/{id}/test", s.notifyTestChannel)
+	mux.HandleFunc("GET /api/notify/deliveries", s.notifyListDeliveries)
+	mux.HandleFunc("POST /api/notify/deliveries/{id}/retry", s.notifyRetryDelivery)
 	mux.HandleFunc("POST /api/settings/web-search/test", s.testWebSearch)
 	mux.HandleFunc("GET /api/report", s.getReport)
 	mux.HandleFunc("GET /api/chat/mentions", s.searchChatMentions)
@@ -2266,14 +2279,20 @@ func (s *Server) patchFinding(w http.ResponseWriter, r *http.Request) {
 			writeErr(w, 400, "bad status: "+*body.Status)
 			return
 		}
-		n, err := s.m.pg.SetFindingStatus(id, *body.Status)
+		// 走带通知的版本：状态更新与「状态变更推送事件」在同一事务里落库，
+		// 避免出现状态已改而推送事件丢失的窗口。事件登记失败不影响状态更新，
+		// 所以只记日志、不向调用方报错。
+		from, found, notified, err := s.m.pg.SetFindingStatusWithNotify(r.Context(), id, *body.Status)
 		if err != nil {
 			writeErr(w, 500, err.Error())
 			return
 		}
-		if n == 0 {
+		if !found {
 			writeErr(w, 404, "finding not found")
 			return
+		}
+		if !notified && from != *body.Status {
+			log.Printf("[notify] 状态变更事件未登记 finding=%d %s→%s（状态已更新）", id, from, *body.Status)
 		}
 	}
 	if body.Severity != nil {
@@ -3293,7 +3312,32 @@ func (s *Server) settingsPayload() map[string]any {
 		// 实验功能:noa 模型驱动上下文压缩(默认关)。开启后平台接入的四类 agent 由 noa
 		// 接管上下文压缩,取代内置 compaction;每 run 读一次,对之后启动的 run 生效。
 		"noa_compaction": s.m.NoaCompactionEnabled(),
+		// 漏洞 IM 推送的全局项。渠道本身是独立资源，走 /api/notify/* 管理；
+		// 这里只放「作用于全部渠道」的三项。
+		"notify_enabled":             s.m.pg.GetBool(settingNotifyEnabled, true),
+		"notify_public_base_url":     notifyPublicBaseURL(s.m.pg),
+		"notify_digest_interval_min": notifyDigestIntervalMin(s.m.pg),
 	}
+}
+
+// notifyPublicBaseURL 读推送回链用的外部地址。
+func notifyPublicBaseURL(pg *db.DB) string {
+	v, _, _ := pg.GetSetting(settingNotifyPublicBaseURL)
+	return v
+}
+
+// notifyDigestIntervalMin 读汇总周期（分钟），非法或未配置时回落到默认值。
+// 回显默认值而不是空串，UI 才能把当前生效值填进输入框。
+func notifyDigestIntervalMin(pg *db.DB) int {
+	v, ok, _ := pg.GetSetting(settingNotifyDigestMinutes)
+	if !ok {
+		return notifyDefaultDigestMinutes
+	}
+	n, err := strconv.Atoi(strings.TrimSpace(v))
+	if err != nil || n <= 0 {
+		return notifyDefaultDigestMinutes
+	}
+	return n
 }
 
 // pgDetectPython re-runs interpreter detection, stores + returns it.
@@ -3340,6 +3384,11 @@ func (s *Server) putSettings(w http.ResponseWriter, r *http.Request) {
 		ConstraintsInjectWorker  *bool `json:"constraints_inject_worker"`
 		// 实验功能:noa 上下文压缩开关(默认关);每 run 读,对之后启动的 run 生效,无需重建 agent。
 		NoaCompaction *bool `json:"noa_compaction"`
+		// 漏洞 IM 推送的全局项。三者都由投递引擎每轮读一次，改完即时生效，
+		// 不需要重建 agent 或重启。
+		NotifyEnabled    *bool   `json:"notify_enabled"`
+		NotifyBaseURL    *string `json:"notify_public_base_url"`
+		NotifyDigestMins *int    `json:"notify_digest_interval_min"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeErr(w, 400, err.Error())
@@ -3360,6 +3409,37 @@ func (s *Server) putSettings(w http.ResponseWriter, r *http.Request) {
 	if req.NoaCompaction != nil {
 		// 每 run 读的解析器,切换即时对之后启动的 run 生效,无需 applyLLM 重建。
 		if err := s.m.SetNoaCompaction(*req.NoaCompaction); err != nil {
+			writeErr(w, 500, err.Error())
+			return
+		}
+	}
+	// 推送全局项:投递引擎每轮重新读取,所以即时生效、无需重启。
+	if req.NotifyEnabled != nil {
+		if err := s.m.pg.SetBool(settingNotifyEnabled, *req.NotifyEnabled); err != nil {
+			writeErr(w, 500, err.Error())
+			return
+		}
+	}
+	if req.NotifyBaseURL != nil {
+		// 统一裁掉尾部斜杠:回链拼接用的是 fmt.Sprintf("%s/function/..."),
+		// 留着尾部斜杠会产出 "//function/..." 这种双斜杠路径。
+		base := trimTrailingSlash(strings.TrimSpace(*req.NotifyBaseURL))
+		if base != "" && !strings.HasPrefix(base, "http://") && !strings.HasPrefix(base, "https://") {
+			writeErr(w, 400, "回链地址需以 http:// 或 https:// 开头")
+			return
+		}
+		if err := s.m.pg.SetSetting(settingNotifyPublicBaseURL, base); err != nil {
+			writeErr(w, 500, err.Error())
+			return
+		}
+	}
+	if req.NotifyDigestMins != nil {
+		// 下限 1 分钟:更短的周期等于实时推送,那样应该直接把渠道改成 realtime 模式。
+		if *req.NotifyDigestMins < 1 || *req.NotifyDigestMins > 24*60 {
+			writeErr(w, 400, "汇总周期需在 1 到 1440 分钟之间")
+			return
+		}
+		if err := s.m.pg.SetSetting(settingNotifyDigestMinutes, strconv.Itoa(*req.NotifyDigestMins)); err != nil {
 			writeErr(w, 500, err.Error())
 			return
 		}
