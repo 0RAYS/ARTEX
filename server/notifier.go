@@ -136,22 +136,48 @@ func (n *Notifier) step(ctx context.Context) {
 		if !ch.IsEnabled() {
 			continue
 		}
-		// 先问令牌桶这一轮还能发几条，再按这个数量去领——顺序不能反，
-		// 否则被限流挡下的投递已经消耗过重试次数。
-		allow := n.takeTokens(ch.ID, ch.RatePerMin, time.Now())
-		if allow > notifyMaxSendsPerChannelPerTick {
-			allow = notifyMaxSendsPerChannelPerTick
-		}
-		if allow <= 0 {
+		// 令牌桶的计量单位是**消息条数**（等价于 HTTP 请求数），不是漏洞条数。
+		// 实时模式下两者相同（一条漏洞一条消息）；汇总模式下一整批漏洞合成
+		// 一条消息，所以只消耗一个令牌。
+		//
+		// 两种模式都先问令牌桶、再按额度去领——顺序不能反，否则被限流挡下的
+		// 投递已经消耗过重试次数。
+		now := time.Now()
+		if ch.Mode == db.NotifyModeDigest {
+			tokens, claimLimit := digestTickPlan()
+			if n.takeTokens(ch.ID, ch.RatePerMin, tokens, now) <= 0 {
+				continue
+			}
+			n.stepDigest(ctx, ch, claimLimit, baseURL)
 			continue
 		}
-		if ch.Mode == db.NotifyModeDigest {
-			// 汇总也受同一份额度约束：领到的条数不能超过本轮令牌数。
-			n.stepDigest(ctx, ch, allow, baseURL)
+		allow := n.takeTokens(ch.ID, ch.RatePerMin, notifyMaxSendsPerChannelPerTick, now)
+		if allow <= 0 {
 			continue
 		}
 		n.stepRealtime(ctx, ch, allow, baseURL)
 	}
+}
+
+// digestTickPlan 返回汇总渠道本轮的令牌消耗与批次大小上界。
+//
+// 两个返回值是**两个不同的量纲**，这正是独立成函数的理由：
+//
+//   - tokens 是消息条数。一批漏洞合成一条消息、发一次 HTTP 请求，所以恒为 1。
+//     rate_per_min 因此仍然对 digest 生效（每分钟最多这么多条汇总消息）。
+//   - claimLimit 是这一批最多装几条漏洞。它只受内存上界约束，与请求预算无关。
+//
+// 曾经为了让 rate_per_min 对 digest 生效，把每轮请求预算
+// （notifyMaxSendsPerChannelPerTick，由租约倒推而来）直接当批次大小传下去。
+// 后果是 rate_per_min=20 的渠道在 3 秒的 tick 里只补到 1 个令牌，于是每条汇总
+// 消息只装 1 个漏洞——digest 退化成「带汇总文案的实时推送」，读者收到的是一串
+// 「近 30 分钟新增 1 个漏洞」，而 db.MaxDigestBatchSize 永不可达。
+//
+// 这个症状在端到端测试里不容易发现（现有用例都手动传一个够大的 limit 给
+// stepDigest，绕过了 step 里的额度计算），所以把决策收在这里由
+// TestDigestTickPlanDecouplesBatchSizeFromSendBudget 直接钉住。
+func digestTickPlan() (tokens, claimLimit int) {
+	return 1, db.MaxDigestBatchSize
 }
 
 // stepRealtime 领取并投递某渠道的实时任务，一条漏洞一条消息。
@@ -422,14 +448,23 @@ func (n *Notifier) itemFor(ctx context.Context, snap notify.Snapshot, baseURL st
 	return item, nil
 }
 
-// takeTokens 从渠道令牌桶里取出本轮可投递的条数。
+// takeTokens 从渠道令牌桶里取走**最多 want 个**令牌，返回实际取到的数量。
 //
-// 桶容量为该渠道每分钟上限：积压时最多一次性冲这么多（平台规则允许），
-// 之后按恒定速率补充。ratePerMin<=0 表示不限流，返回一个有限但足够大的值，
-// 防止单轮循环被无限积压拖住。
-func (n *Notifier) takeTokens(channelID int64, ratePerMin int, now time.Time) int {
+// 一个令牌 = 一条消息（一次 HTTP 请求）。实时模式下调用方要几条就传几条；
+// 汇总模式下一整批漏洞只发一条消息，传 1。
+//
+// 桶容量为该渠道每分钟上限，按恒定速率补充。ratePerMin<=0 表示不限流，
+// 返回一个有限但足够大的值，防止单轮循环被无限积压拖住。
+//
+// want 这个上限是必需的：没有它就只能把桶整个抽空，而调用方自己还有每轮上限，
+// 多取的令牌既用不上、又在下次补充前凭空消失——攒下来的突发容量永远不可达，
+// 连「这一轮没有任何待发投递」都会照扣一笔。
+func (n *Notifier) takeTokens(channelID int64, ratePerMin, want int, now time.Time) int {
+	if want <= 0 {
+		return 0
+	}
 	if ratePerMin <= 0 {
-		return notifyUnlimitedBurstPerTick
+		return min(want, notifyUnlimitedBurstPerTick)
 	}
 	n.mu.Lock()
 	defer n.mu.Unlock()
@@ -446,7 +481,7 @@ func (n *Notifier) takeTokens(channelID int64, ratePerMin int, now time.Time) in
 	// 加一个极小 epsilon 再取整：令牌数是浮点累加出来的，分两次补满时
 	// 0.5 + 0.5 可能得到 0.9999999999，直接 int() 会被截成 0——
 	// 数学上已满的桶却取不出令牌。1e-9 远小于一个令牌，不会放过真正的欠额。
-	take := int(b.tokens + 1e-9)
+	take := min(int(b.tokens+1e-9), want)
 	if take <= 0 {
 		return 0
 	}

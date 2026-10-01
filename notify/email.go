@@ -130,8 +130,13 @@ func (c emailChannel) Send(ctx context.Context, cfg map[string]any, m Message) (
 // 会话期限在**建连处**就设好（而非事后补设），因为 net/smtp 的 Client 把底层
 // 连接藏在未导出字段里，外部拿不到它；连接一旦交出去就只能靠预先设置的 deadline
 // 兜底。这也顺带覆盖了握手阶段的阻塞。
+// Control 挂 blockInternalDial 与 HTTP 系渠道共用同一道守卫。不挂的话 SMTP
+// 就是整套 SSRF 防护的缺口：host 填 169.254.169.254 或 127.0.0.1 能直接连上，
+// 而 smtp.NewClient 握手失败时会把对端返回的那一行包进错误、经 last_error
+// 由投递历史接口回显，构成半盲读原语；「连接被拒 vs 超时」的耗时差异还能
+// 用来探测端口。拨号阶段是最终生效点，也覆盖 DNS 重绑定。
 func emailDial(ctx context.Context, addr, host string, implicitTLS bool) (*smtp.Client, error) {
-	d := &net.Dialer{Timeout: emailDialTimeout}
+	d := &net.Dialer{Timeout: emailDialTimeout, Control: blockInternalDial}
 	var conn net.Conn
 	var err error
 	if implicitTLS {

@@ -147,3 +147,47 @@ func TestValidateHTTPURLErrorNeverLeaksCredentials(t *testing.T) {
 	}
 	assertNoSecret(t, err.Error(), leakProbeToken)
 }
+
+// TestEmailDialGuardRejectsLoopbackByDefault 覆盖 SMTP 渠道的拨号守卫。
+//
+// 邮件渠道曾经用的是裸 net.Dialer，是整套 SSRF 防护里唯一的缺口：host 填成
+// 169.254.169.254 或 127.0.0.1 能直接连上，而 smtp.NewClient 握手失败时会把
+// 对端返回的那一行包进错误、经 last_error 由投递历史接口回显——正是其它渠道
+// 已经关掉的半盲读原语；「连接被拒 vs 超时」的耗时差异还能用来探测端口。
+//
+// 本包的 TestMain 全局打开了 AllowLocalTargetsEnv（大量用例用 127.0.0.1 上的
+// 假接收端），所以这个用例必须自己把它清掉——否则守卫在不在都会通过，
+// 这也正是缺口当初没被任何测试发现的原因。
+func TestEmailDialGuardRejectsLoopbackByDefault(t *testing.T) {
+	f := newFakeSMTP(t)
+	cfg := emailCfg(t, f, nil)
+
+	t.Setenv(AllowLocalTargetsEnv, "") // 关掉逃生口 = 默认行为
+	_, err := (emailChannel{}).Send(context.Background(), cfg, singleMsg())
+	if err == nil {
+		t.Fatal("默认不应允许把邮件投递到环回地址")
+	}
+	// 连接根本不该建立：守卫在 Control 钩子里拦下，EHLO 永远发不出去。
+	if f.sawCommand("EHLO") || f.sawCommand("HELO") {
+		t.Fatal("SMTP 会话已经建立——守卫没生效")
+	}
+	// 错误信息要能指导用户怎么放开（本机 postfix 中继是合法配置）。
+	if !strings.Contains(err.Error(), AllowLocalTargetsEnv) {
+		t.Errorf("拒绝信息应说明如何显式放开: %v", err)
+	}
+}
+
+// TestEmailDialGuardAllowsLoopbackWhenOptedIn 是配对的反向用例：显式打开后
+// 必须能正常投递。内网自建 SMTP / 本机中继是非常常见的部署，守卫不能一刀切。
+func TestEmailDialGuardAllowsLoopbackWhenOptedIn(t *testing.T) {
+	f := newFakeSMTP(t)
+	cfg := emailCfg(t, f, nil)
+
+	t.Setenv(AllowLocalTargetsEnv, "1")
+	if _, err := (emailChannel{}).Send(context.Background(), cfg, singleMsg()); err != nil {
+		t.Fatalf("显式放开后本机 SMTP 应可投递: %v", err)
+	}
+	if !f.sawCommand("EHLO") {
+		t.Fatal("未看到 EHLO——会话没真正建立")
+	}
+}

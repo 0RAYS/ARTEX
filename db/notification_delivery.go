@@ -171,9 +171,15 @@ func (d *DB) ClaimDigestBatch(ctx context.Context, channelID int64, limit int, l
 	if limit <= 0 {
 		return nil, nil
 	}
-	// 单批同时受两个上界约束：调用方的限流额度（本轮还能发几条）与内存上界
-	// MaxDigestBatchSize。此前只用了后者，于是 digest 渠道的 rate_per_min
-	// 完全不生效——令牌被 takeTokens 扣掉却没人用，等于白扣。
+	// limit 是**内存上界**，调用方传 MaxDigestBatchSize；这里再夹一道，
+	// 防止调用方传进一个更大的值。
+	//
+	// 刻意不接受「限流额度」充当批次大小：限流的单位是消息条数——一个批次只发
+	// 一条消息、消耗一个令牌，由 server 层的 takeTokens 扣除——与「一批装几条
+	// 漏洞」是两个不同的量纲。曾经为了让 rate_per_min 对 digest 生效而把每轮
+	// 请求预算传进来当批次大小，结果 rate=20/min 的渠道每批只装 1 条漏洞，
+	// digest 退化成带汇总文案的实时推送。要改限流请改 takeTokens 的 want，
+	// 不要动这里。
 	if limit > MaxDigestBatchSize {
 		limit = MaxDigestBatchSize
 	}
