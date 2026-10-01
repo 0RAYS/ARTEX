@@ -277,6 +277,78 @@ func TestPrepareConfigUpdatePortTypeTolerance(t *testing.T) {
 	}
 }
 
+// TestPrepareConfigUpdateSurvivesRepeatedSaveWithBlankDestination 覆盖「可留空的
+// 目的地字段」这条路径：Telegram 的 base_url 留空表示用官方 API 地址。
+//
+// 曾经这里会让渠道从第二次保存起永久保存失败：
+//
+//	新建时库里存下 base_url:""（创建路径直接存前端提交的 config，不走 MergeConfig）
+//	→ 第一次保存，MergeConfig 把空串当显式清空、delete 掉该键
+//	→ 第二次保存，incoming 仍是 ""、而 stored 里已经没这个键，被判成「地址变了」
+//	→ bot_token 是掩码回显值 → 400「目标地址已变更，请同时重新填写凭据字段」
+//
+// 用户什么都没改，却从此再也存不上，除非重新粘贴一遍 Bot Token。
+func TestPrepareConfigUpdateSurvivesRepeatedSaveWithBlankDestination(t *testing.T) {
+	stored := map[string]any{"bot_token": "123:ABC", "chat_id": "-100", "base_url": ""}
+
+	// 前端 buildConfig() 对该渠道的每个字段定义都提交一个值：凭据回填掩码，
+	// 空文本框提交空串。这里完整复现它的输出，而不是只提交「改动的键」。
+	submit := func() map[string]any {
+		return map[string]any{
+			"bot_token": MaskedValue("123:ABC"),
+			"chat_id":   "-100",
+			"base_url":  "",
+		}
+	}
+
+	// 第一次保存：只改了渠道名字，config 原样回传。
+	merged, err := PrepareConfigUpdate(KindTelegram, stored, submit())
+	if err != nil {
+		t.Fatalf("第一次保存被误拦: %v", err)
+	}
+	if _, ok := merged["base_url"]; ok {
+		t.Fatal("前提已变：空串应被 MergeConfig 删除——本用例要覆盖的正是「键消失之后」那一步")
+	}
+
+	// 第二次保存：提交内容与上次完全一致，用户什么都没改。
+	merged2, err := PrepareConfigUpdate(KindTelegram, merged, submit())
+	if err != nil {
+		t.Fatalf("第二次保存被误拦（用户什么都没改）: %v", err)
+	}
+	// 第三次，确认不是「只错一次」而是稳定可保存。
+	if _, err := PrepareConfigUpdate(KindTelegram, merged2, submit()); err != nil {
+		t.Fatalf("第三次保存被误拦: %v", err)
+	}
+	// 凭据必须一路保留下来，没有被空串逻辑连带清掉。
+	if got := merged2["bot_token"]; got != "123:ABC" {
+		t.Fatalf("Bot Token 应沿用原值，得到 %v", got)
+	}
+}
+
+// TestPrepareConfigUpdateStillGuardsBlankDestinationChanges 是上一条用例的配对
+// 断言：把空串与「键不存在」视为等价，**不能**连带放过真正的地址变更。
+// 这两个方向都是真实的凭据外发路径——Telegram 的 Bot Token 走在 URL 路径里，
+// 换了 base_url 就等于把 Token 送给新地址。
+func TestPrepareConfigUpdateStillGuardsBlankDestinationChanges(t *testing.T) {
+	// 方向一：从「空」（官方地址）换到自建地址。
+	official := map[string]any{"bot_token": "123:ABC", "chat_id": "-100"}
+	if _, err := PrepareConfigUpdate(KindTelegram, official, map[string]any{
+		"bot_token": MaskedValue("123:ABC"),
+		"base_url":  "https://tg-proxy.attacker.tld",
+	}); err == nil {
+		t.Fatal("从官方地址换到自建地址必须要求重新填写 Token")
+	}
+
+	// 方向二：把自建地址清空（= 换回官方 API）同样是地址变更。
+	proxied := map[string]any{"bot_token": "123:ABC", "base_url": "https://proxy.internal/bot"}
+	if _, err := PrepareConfigUpdate(KindTelegram, proxied, map[string]any{
+		"bot_token": MaskedValue("123:ABC"),
+		"base_url":  "",
+	}); err == nil {
+		t.Fatal("清空自建地址（换回官方 API）同样是地址变更，必须要求重新填写 Token")
+	}
+}
+
 func TestDestinationKeysDeclaredForEveryKind(t *testing.T) {
 	// 与 SecretKeys 同理：渠道若忘记声明目的地键，PrepareConfigUpdate 就保护不到它。
 	for kind, ch := range registry {

@@ -183,8 +183,19 @@ func rejectMaskedInContainers(incoming map[string]any, secretKeys []string) erro
 
 // sameConfigValue 比较两个配置值是否等价。用 JSON 序列化比较是为了顺带处理
 // 类型差异——前端提交的端口是 number，而库里读回来的是 float64，直接 == 会误判。
+//
+// 「空」必须先归一化再比较：空串与「键不存在」在这个配置模型里是同一个状态，
+// 因为 MergeConfig 把空串当显式清空、直接 delete 掉该键。不归一化的话，一个
+// 始终留空的可选目的地字段（Telegram 的 base_url 是唯一这样的字段：留空即用
+// 官方地址）会走成这条路径——
+//
+//	新建时存下 base_url:""  →  第一次保存被 MergeConfig 删键
+//	→ 第二次保存时 incoming 是 ""、stored 缺键，被判成「地址变了」
+//	→ 凭据是掩码值 → 400「目标地址已变更，请同时重新填写凭据字段」
+//
+// 此后每次保存都失败，除非用户重新粘贴一遍 Bot Token，而他什么都没改。
 func sameConfigValue(a, b any) bool {
-	if a == nil && b == nil {
+	if isBlankConfigValue(a) && isBlankConfigValue(b) {
 		return true
 	}
 	ra, errA := json.Marshal(a)
@@ -193,6 +204,17 @@ func sameConfigValue(a, b any) bool {
 		return false
 	}
 	return string(ra) == string(rb)
+}
+
+// isBlankConfigValue 判定一个配置值是否为「空」。
+// 口径必须与 MergeConfig 的清空判定一致（strings.TrimSpace(s) == ""），
+// 否则会出现「MergeConfig 认为该删、sameConfigValue 认为有值」的夹缝。
+func isBlankConfigValue(v any) bool {
+	if v == nil {
+		return true
+	}
+	s, ok := v.(string)
+	return ok && strings.TrimSpace(s) == ""
 }
 
 // MergeConfig 把 incoming 合并到 stored 之上，用于更新渠道配置。
