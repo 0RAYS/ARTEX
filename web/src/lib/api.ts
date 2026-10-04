@@ -53,6 +53,7 @@ import type {
   InterceptPending,
   InterceptRule,
   JudgeConfig,
+  JudgeUsage,
   LLMPoolStatus,
   LLMProfile,
   LLMRecordDetail,
@@ -1265,6 +1266,7 @@ export const api = {
   // ---- intercept LLM judge (模型兜底审批,全局配置) ----
   interceptGetJudgeConfig: () => get<JudgeConfig>("/intercept/judge"),
   interceptSetJudgeConfig: (cfg: JudgeConfig) => put<{ ok: boolean }>("/intercept/judge", cfg),
+  interceptJudgeUsage: (days = 30) => get<JudgeUsage>(`/intercept/judge/usage?days=${days}`),
 
   // ---- commands (tool execution history, any tool) ----
   commands: (params?: { task?: string; q?: string; page?: number; size?: number }) => {
