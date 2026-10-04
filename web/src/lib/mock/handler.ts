@@ -2464,6 +2464,15 @@ function route(m: string, path: string, seg: string[], q: URLSearchParams, b: Re
       ask_timeout_action: "deny",
     };
   if (path === "/intercept/judge" && m === "PUT") return { ok: true };
+  if (path === "/intercept/judge/usage" && m === "GET")
+    return {
+      calls: 0,
+      input_tokens: 0,
+      output_tokens: 0,
+      cache_read_tokens: 0,
+      cache_write_tokens: 0,
+      daily: [],
+    };
 
   // ── 旁路提问(/btw)：demo 无旁路会话 ──
   // 必须显式命中：路径以 s 结尾会被下面的读兜底判成集合返回 []，items 就成了 undefined。
