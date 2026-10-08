@@ -87,7 +87,7 @@ cd ARTEX
 git clone https://github.com/Autumn-27/ARTEX.git
 cd ARTEX
 cp .env.example .env          # 填 POSTGRES_PASSWORD、可选 ANTHROPIC_API_KEY
-docker compose up -d          # 拉取 autumn27/artex 镜像 + postgres
+docker compose up -d          # 拉取 ghcr.io/0rays/artex 镜像 + postgres
 # → http://localhost:8787
 ```
 
